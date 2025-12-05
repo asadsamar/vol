@@ -5,7 +5,7 @@ import logging
 import configparser
 import requests
 import time
-from typing import Dict, Optional, Callable, List
+from typing import Dict, Optional, Callable, List, Tuple
 from collections import defaultdict
 
 from ibkr.fields import IBKRMarketDataFields
@@ -42,10 +42,24 @@ class IBWebSocketClient:
             rest_client: Optional REST API client for session management
         """
         self.config = configparser.ConfigParser()
-        self.config.read(config_file)
+        files_read = self.config.read(config_file)
         
-        self.base_url = self.config.get('ibkr', 'base_url', fallback='https://localhost:5000')
-        self.ws_url = self.base_url.replace('https://', 'wss://').replace('http://', 'ws://') + '/v1/api/ws'
+        if not files_read:
+            logger.warning(f"Could not read config file: {config_file}")
+        else:
+            logger.info(f"Read config file: {config_file}")
+        
+        # Read from config file - use 'api' section, not 'ibkr'
+        self.base_url = self.config.get('api', 'base_url', fallback='https://localhost:5000/v1/api')
+        
+        # Check if ws_url is explicitly set in config
+        if self.config.has_option('api', 'ws_url'):
+            self.ws_url = self.config.get('api', 'ws_url')
+            logger.info(f"Using WebSocket URL from config: {self.ws_url}")
+        else:
+            # Derive from base_url
+            self.ws_url = self.base_url.replace('https://', 'wss://').replace('http://', 'ws://').replace('/v1/api', '') + '/v1/api/ws'
+            logger.info(f"Derived WebSocket URL from base_url: {self.ws_url}")
         
         self.ws = None
         self.ws_thread = None
@@ -65,6 +79,11 @@ class IBWebSocketClient:
         self.session.verify = False  # Disable SSL verification for self-signed certs
         
         self._connection_lock = threading.Lock()
+        
+        logger.info(f"IBWebSocketClient initialized")
+        logger.info(f"  Config file: {config_file}")
+        logger.info(f"  Base URL: {self.base_url}")
+        logger.info(f"  WebSocket URL: {self.ws_url}")
     
     def _load_config(self, config_file: str) -> configparser.ConfigParser:
         """Load configuration from file."""
@@ -273,16 +292,10 @@ class IBWebSocketClient:
     def _on_message(self, ws, message):
         """Handle incoming WebSocket message."""
         try:
-            # Force INFO level to ensure we see this
-            logger.info(f"🔵 RAW WebSocket message received: {message}")
-            
             data = json.loads(message)
             
             # Extract topic
             topic = data.get('topic', '')
-            
-            logger.info(f"🔵 Parsed topic: {topic}")
-            logger.info(f"🔵 Full data: {data}")
             
             # Handle different message types
             if topic == 'system':
@@ -291,7 +304,6 @@ class IBWebSocketClient:
                 self._handle_server_status(data)
             elif topic.startswith('smd+'):
                 # Market data with conid
-                logger.info(f"🔵 Routing to market data handler")
                 self._handle_market_data(data)
             elif topic == 'smd':
                 # This is the error case - log the full message
@@ -302,11 +314,10 @@ class IBWebSocketClient:
             else:
                 # Generic topic handler
                 if topic in self.callbacks:
-                    logger.info(f"🔵 Found {len(self.callbacks[topic])} callbacks for topic: {topic}")
                     for callback in self.callbacks[topic]:
                         callback(data)
                 else:
-                    logger.info(f"⚠️ Unhandled WebSocket message on topic '{topic}': {data}")
+                    logger.debug(f"Unhandled WebSocket message on topic '{topic}': {data}")
         
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse WebSocket message: {e}")
@@ -356,16 +367,39 @@ class IBWebSocketClient:
             # Register callback if provided
             if callback:
                 self.callbacks[topic_key].append(callback)
-                logger.info(f"Registered callback for topic: {topic_key}")
             
             # Send subscription message
             self.ws.send(topic)
-            logger.info(f"Sent subscription message: {topic}")
             
             return True
             
         except Exception as e:
             logger.error(f"Failed to subscribe to topic '{topic}': {e}", exc_info=True)
+            return False
+    
+    def unsubscribe_market_data(self, conid: int) -> bool:
+        """
+        Unsubscribe from streaming market data for a contract.
+        
+        Args:
+            conid: Contract ID to unsubscribe from
+            
+        Returns:
+            True if unsubscription successful
+        """
+        try:
+            # Remove the book reference
+            if conid in self.market_data_books:
+                del self.market_data_books[conid]
+            
+            # Use the generic unsubscribe method
+            topic = f'smd+{conid}'
+            logger.info(f"Unsubscribing from market data for conid {conid}")
+            
+            return self.unsubscribe(topic)
+            
+        except Exception as e:
+            logger.error(f"Failed to unsubscribe from market data for conid {conid}: {e}", exc_info=True)
             return False
     
     def unsubscribe(self, topic: str) -> bool:
@@ -388,10 +422,19 @@ class IBWebSocketClient:
                 del self.callbacks[topic]
             
             # Send unsubscription message for market data topics
-            if topic.startswith('smd') or topic.startswith('sor'):
-                unsubscribe_msg = f"umd+{topic.split('+')[1]}" if topic.startswith('smd') else f"u{topic}"
+            if topic.startswith('smd+'):
+                # Extract conid from topic (format: smd+{conid} or smd+{conid}+{fields})
+                conid = topic.split('+')[1]
+                unsubscribe_msg = f"umd+{conid}"
                 self.ws.send(unsubscribe_msg)
                 logger.info(f"Sent unsubscription message: {unsubscribe_msg}")
+            elif topic.startswith('sor+'):
+                conid = topic.split('+')[1]
+                unsubscribe_msg = f"uor+{conid}"
+                self.ws.send(unsubscribe_msg)
+                logger.info(f"Sent unsubscription message: {unsubscribe_msg}")
+            else:
+                logger.debug(f"No unsubscription message needed for topic: {topic}")
             
             logger.info(f"Unsubscribed from topic: {topic}")
             return True
@@ -400,71 +443,50 @@ class IBWebSocketClient:
             logger.error(f"Failed to unsubscribe from topic '{topic}': {e}", exc_info=True)
             return False
     
-    def subscribe_market_data(self, conid: int, book: Book) -> bool:
+    def subscribe_market_data(self, conid: int, option: 'Option', is_option: bool = True) -> bool:
         """
         Subscribe to streaming market data for a contract.
         
-        Automatically subscribes to all standard market data fields and updates the provided Book object.
+        Automatically subscribes to appropriate fields based on instrument type.
+        For options: includes Greeks, IV, and underlying price.
+        For stocks: basic quotes only.
         
         Args:
             conid: Contract ID to subscribe to
-            book: Book object to update with market data
+            option: Option object to update with market data (for Greeks) or Book object for non-options
+            is_option: Whether this is an option contract (default: True)
             
         Returns:
             True if subscription successful
         """
         try:
-            # Store the book reference for this conid
-            self.market_data_books[conid] = book
+            # Store the option reference for this conid
+            self.market_data_books[conid] = option
             
-            # Use the standard full quotes field set
-            fields = IBKRMarketDataFields.FULL_QUOTES
+            # Use appropriate field set based on instrument type
+            if is_option:
+                fields = IBKRMarketDataFields.OPTION_QUOTES
+            else:
+                fields = IBKRMarketDataFields.FULL_QUOTES
             
             # Format exactly as shown in IBKR docs:
             # ws.send('smd+'+conid+'+{"fields":["31","84","86"]}')
             fields_json = '{"fields":' + json.dumps(fields) + '}'
             topic = f'smd+{conid}+{fields_json}'
             
-            logger.info(f"Subscribing to market data for conid {conid}")
-            
             # Use the generic subscribe() method
-            # The callback will be handled internally by _handle_market_data
             return self.subscribe(topic, callback=None)
             
         except Exception as e:
             logger.error(f"Failed to subscribe to market data for conid {conid}: {e}", exc_info=True)
             return False
     
-    def unsubscribe_market_data(self, conid: int) -> bool:
-        """
-        Unsubscribe from streaming market data for a contract.
-        
-        Args:
-            conid: Contract ID to unsubscribe from
-            
-        Returns:
-            True if unsubscription successful
-        """
-        try:
-            if not self.is_connected:
-                logger.warning("Cannot unsubscribe from market data - WebSocket not connected")
-                return False
-            
-            # Build unsubscription message
-            # Format: umd+{conid}
-            unsub_msg = f'umd+{conid}'
-            
-            logger.info(f"Unsubscribing from market data for conid {conid}")
-            self.ws.send(unsub_msg)
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to unsubscribe from market data for conid {conid}: {e}", exc_info=True)
-            return False
-    
     def _handle_system(self, data: Dict):
         """Handle system messages."""
+        # Filter out heartbeat messages
+        if 'hb' in data:
+            return
+        
         logger.info(f"System message: {data}")
         
         # Notify callbacks
@@ -490,7 +512,7 @@ class IBWebSocketClient:
     def _handle_market_data(self, data: Dict):
         """
         Handle streaming market data updates.
-        Automatically updates the Book object associated with the conid.
+        Automatically updates the Book and Option objects associated with the conid.
         """
         try:
             conid = data.get('conid')
@@ -498,15 +520,11 @@ class IBWebSocketClient:
                 logger.warning("Market data update missing conid")
                 return
             
-            # Print raw data for debugging
-            logger.debug(f"Raw market data for conid {conid}: {data}")
-            
             # Helper function to safely convert string to float
             def safe_float(value):
                 if value is None:
                     return None
                 try:
-                    # Remove commas if present (for volume)
                     if isinstance(value, str):
                         value = value.replace(',', '')
                     return float(value)
@@ -524,27 +542,39 @@ class IBWebSocketClient:
                 except (ValueError, TypeError):
                     return None
             
-            # Extract and convert price fields using field constants
+            # Extract price fields
             bid = safe_float(data.get(IBKRMarketDataFields.BID_PRICE))
             ask = safe_float(data.get(IBKRMarketDataFields.ASK_PRICE))
             last = safe_float(data.get(IBKRMarketDataFields.LAST_PRICE))
             bid_size = safe_int(data.get(IBKRMarketDataFields.BID_SIZE))
             ask_size = safe_int(data.get(IBKRMarketDataFields.ASK_SIZE))
             last_size = safe_int(data.get(IBKRMarketDataFields.LAST_SIZE))
+            
+            # Extract Greeks
+            delta = safe_float(data.get(IBKRMarketDataFields.DELTA))
+            gamma = safe_float(data.get(IBKRMarketDataFields.GAMMA))
+            vega = safe_float(data.get(IBKRMarketDataFields.VEGA))
+            theta = safe_float(data.get(IBKRMarketDataFields.THETA))
+            
+            # Extract volatility fields
+            implied_vol = safe_float(data.get(IBKRMarketDataFields.IMPLIED_VOL))
+            hist_vol = safe_float(data.get(IBKRMarketDataFields.HIST_VOL))
+            underlying_price = safe_float(data.get(IBKRMarketDataFields.UNDERLYING_PRICE))
+            
             timestamp = data.get('_updated', time.time() * 1000) / 1000.0
             
             # Check if we have actual price data (not just metadata)
             has_price_data = bid is not None or ask is not None or last is not None
             
             if not has_price_data:
-                # This is just metadata (symbol/exchange info)
-                logger.debug(f"Metadata for conid {conid}: {data.get(IBKRMarketDataFields.SYMBOL)}")
                 return
             
-            # Find the book object for this conid and update it
+            # Find the option object for this conid and update it
             if conid in self.market_data_books:
-                book = self.market_data_books[conid]
-                book.update(
+                option = self.market_data_books[conid]
+                
+                # Update the option's book with prices
+                option.option_book.update(
                     bid=bid,
                     ask=ask,
                     last=last,
@@ -554,21 +584,122 @@ class IBWebSocketClient:
                     timestamp=timestamp
                 )
                 
-                # Log the update
-                symbol = data.get(IBKRMarketDataFields.SYMBOL, f"conid={conid}")
-                price_parts = []
-                if bid is not None:
-                    price_parts.append(f"Bid={bid:.2f}")
-                if ask is not None:
-                    price_parts.append(f"Ask={ask:.2f}")
-                if last is not None:
-                    price_parts.append(f"Last={last:.2f}")
-                
-                if price_parts:
-                    logger.info(f"Updated {symbol}: {' '.join(price_parts)}")
-            else:
-                logger.debug(f"No book registered for conid {conid}")
+                # Update the option's Greeks
+                option.update_greeks(
+                    delta=delta,
+                    gamma=gamma,
+                    vega=vega,
+                    theta=theta,
+                    implied_vol=implied_vol,
+                    hist_vol=hist_vol,
+                    underlying_price=underlying_price,
+                    timestamp=timestamp
+                )
             
         except Exception as e:
             logger.error(f"Error handling market data: {e}", exc_info=True)
             logger.error(f"Raw data: {data}")
+    
+    def subscribe_account_updates(self, callback: Callable) -> bool:
+        """
+        Subscribe to account ledger and summary updates.
+        
+        Args:
+            callback: Function to call when account data changes
+            
+        Returns:
+            True if subscription successful
+        """
+        try:
+            # Subscribe to account ledger (spl)
+            if not self.subscribe('spl', callback):
+                return False
+            
+            # Subscribe to account summary (ssd)
+            if not self.subscribe('ssd', callback):
+                return False
+            
+            logger.info("Subscribed to account updates")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to subscribe to account updates: {e}", exc_info=True)
+            return False
+    
+    def subscribe_portfolio_updates(self, callback: Callable) -> bool:
+        """
+        Subscribe to portfolio/position updates.
+        
+        Args:
+            callback: Function to call when portfolio changes
+            
+        Returns:
+            True if subscription successful
+        """
+        try:
+            # Subscribe to portfolio ledger
+            if not self.subscribe('spl', callback):
+                return False
+            
+            logger.info("Subscribed to portfolio updates")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to subscribe to portfolio updates: {e}", exc_info=True)
+            return False
+    
+    def subscribe_order_updates(self, callback: Callable) -> bool:
+        """
+        Subscribe to order status updates.
+        
+        Args:
+            callback: Function to call when orders change
+            
+        Returns:
+            True if subscription successful
+        """
+        try:
+            # Subscribe to streaming orders (sor)
+            if not self.subscribe('sor', callback):
+                return False
+            
+            logger.info("Subscribed to order updates")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to subscribe to order updates: {e}", exc_info=True)
+            return False
+    
+    def subscribe_all_position_market_data(self, options: List) -> Tuple[int, int]:
+        """
+        Subscribe to market data for a list of option positions.
+        
+        Args:
+            options: List of Option objects with conid attribute
+            
+        Returns:
+            Tuple of (successful_subscriptions, failed_subscriptions)
+        """
+        subscribed = 0
+        failed = 0
+        
+        for opt in options:
+            if not opt.conid:
+                logger.warning(f"Skipping {opt.symbol} - no conid")
+                failed += 1
+                continue
+            
+            logger.info(f"Subscribing to market data for {opt.symbol} (conid={opt.conid})...")
+            
+            # Pass the entire Option object, not just the book
+            if self.subscribe_market_data(opt.conid, opt, is_option=True):
+                subscribed += 1
+                logger.info(f"  ✓ Subscribed successfully")
+            else:
+                failed += 1
+                logger.warning(f"  ✗ Subscription failed")
+            
+            time.sleep(0.1)  # Rate limiting
+        
+        logger.info(f"Market data subscription summary: {subscribed} succeeded, {failed} failed")
+        return subscribed, failed

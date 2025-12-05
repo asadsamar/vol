@@ -46,13 +46,134 @@ class Option:
         self.multiplier = multiplier
         self.currency = currency
         
-        # Market data books
+        # Market data books (only prices and sizes)
         self.option_book = Book()
         self.underlyer_book = Book()
         
-        # Validate option type
-        if self.option_type not in ['CALL', 'PUT']:
-            raise ValueError(f"Invalid option_type: {option_type}. Must be 'CALL' or 'PUT'")
+        # Greeks and volatility (option-specific data)
+        self.delta: Optional[float] = None
+        self.gamma: Optional[float] = None
+        self.vega: Optional[float] = None
+        self.theta: Optional[float] = None
+        self.implied_vol: Optional[float] = None
+        self.hist_vol: Optional[float] = None
+        self.underlying_price: Optional[float] = None
+        self.greeks_timestamp: Optional[float] = None
+    
+    def update_option_book(
+        self,
+        bid: Optional[float] = None,
+        ask: Optional[float] = None,
+        last: Optional[float] = None,
+        bid_size: Optional[int] = None,
+        ask_size: Optional[int] = None,
+        last_size: Optional[int] = None,
+        timestamp: Optional[float] = None
+    ):
+        """Update option market data book."""
+        self.option_book.update(
+            bid=bid,
+            ask=ask,
+            last=last,
+            bid_size=bid_size,
+            ask_size=ask_size,
+            last_size=last_size,
+            timestamp=timestamp
+        )
+    
+    def update_underlyer_book(
+        self,
+        bid: Optional[float] = None,
+        ask: Optional[float] = None,
+        last: Optional[float] = None,
+        bid_size: Optional[int] = None,
+        ask_size: Optional[int] = None,
+        last_size: Optional[int] = None,
+        timestamp: Optional[float] = None
+    ):
+        """Update underlying market data book."""
+        self.underlyer_book.update(
+            bid=bid,
+            ask=ask,
+            last=last,
+            bid_size=bid_size,
+            ask_size=ask_size,
+            last_size=last_size,
+            timestamp=timestamp
+        )
+    
+    def update_greeks(
+        self,
+        delta: Optional[float] = None,
+        gamma: Optional[float] = None,
+        vega: Optional[float] = None,
+        theta: Optional[float] = None,
+        implied_vol: Optional[float] = None,
+        hist_vol: Optional[float] = None,
+        underlying_price: Optional[float] = None,
+        timestamp: Optional[float] = None
+    ):
+        """Update option Greeks and volatility data."""
+        if delta is not None:
+            self.delta = delta
+        if gamma is not None:
+            self.gamma = gamma
+        if vega is not None:
+            self.vega = vega
+        if theta is not None:
+            self.theta = theta
+        if implied_vol is not None:
+            self.implied_vol = implied_vol
+        if hist_vol is not None:
+            self.hist_vol = hist_vol
+        if underlying_price is not None:
+            self.underlying_price = underlying_price
+        if timestamp is not None:
+            self.greeks_timestamp = timestamp
+    
+    def get_exercise_probability(self) -> Optional[float]:
+        """
+        Calculate probability of exercise based on delta.
+        
+        For puts: delta is negative, so probability = abs(delta)
+        For calls: delta is positive, so probability = delta
+        
+        Delta approximates the probability of the option being in-the-money at expiration.
+        
+        Returns:
+            Probability (0.0 to 1.0) or None if delta not available
+        """
+        if self.delta is None:
+            return None
+        
+        # For puts, delta is negative (e.g., -0.30 means ~30% chance of being ITM)
+        # For calls, delta is positive (e.g., 0.30 means ~30% chance of being ITM)
+        return abs(self.delta)
+    
+    def get_exercise_risk_amount(self) -> Optional[float]:
+        """
+        Calculate the dollar amount at risk if option is exercised.
+        
+        For short puts: strike * multiplier * abs(quantity) * probability
+        For short calls: strike * multiplier * abs(quantity) * probability
+        
+        Returns:
+            Dollar amount at risk, or None if probability can't be calculated
+        """
+        prob = self.get_exercise_probability()
+        if prob is None:
+            return None
+        
+        # For short positions, quantity is negative
+        contracts = abs(self.quantity)
+        
+        # Exercise amount = strike * multiplier * contracts
+        exercise_amount = self.strike * self.multiplier * contracts
+        
+        # Risk-adjusted amount = exercise_amount * probability
+        risk_adjusted_amount = exercise_amount * prob
+        
+        return risk_adjusted_amount
     
     @classmethod
     def from_ibkr_position(cls, position: Dict) -> Optional['Option']:
@@ -187,48 +308,6 @@ class Option:
             logger.error(f"Error creating Option from IBKR position: {e}", exc_info=True)
             logger.error(f"Position data: {position}")
             return None
-    
-    def update_option_book(
-        self,
-        bid: Optional[float] = None,
-        ask: Optional[float] = None,
-        last: Optional[float] = None,
-        bid_size: Optional[int] = None,
-        ask_size: Optional[int] = None,
-        last_size: Optional[int] = None,
-        timestamp: Optional[float] = None
-    ):
-        """Update option market data book."""
-        self.option_book.update(
-            bid=bid,
-            ask=ask,
-            last=last,
-            bid_size=bid_size,
-            ask_size=ask_size,
-            last_size=last_size,
-            timestamp=timestamp
-        )
-    
-    def update_underlyer_book(
-        self,
-        bid: Optional[float] = None,
-        ask: Optional[float] = None,
-        last: Optional[float] = None,
-        bid_size: Optional[int] = None,
-        ask_size: Optional[int] = None,
-        last_size: Optional[int] = None,
-        timestamp: Optional[float] = None
-    ):
-        """Update underlying market data book."""
-        self.underlyer_book.update(
-            bid=bid,
-            ask=ask,
-            last=last,
-            bid_size=bid_size,
-            ask_size=ask_size,
-            last_size=last_size,
-            timestamp=timestamp
-        )
     
     @property
     def days_to_expiry(self) -> int:

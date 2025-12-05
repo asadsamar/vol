@@ -24,6 +24,10 @@ import logging
 from datetime import datetime, timedelta
 import threading
 import time
+import websocket
+import json
+import requests
+import configparser
 
 from ibkr.ibkr import IBWebAPIClient
 from ibkr.ibkr_ws import IBWebSocketClient
@@ -31,6 +35,8 @@ from vol_risk.risk_lib import (
     PositionRiskManager,
     analyze_risk_coverage
 )
+
+from ibkr.fields import IBKRMarketDataFields
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,6 +84,10 @@ class PutSellingStrategy:
         # Market data cache
         self.market_data = {}
         self.market_data_lock = threading.Lock()
+        
+        # Last report state for change detection
+        self.last_report_state = None
+        self.last_report_lock = threading.Lock()
     
     def connect(self) -> bool:
         """
@@ -182,33 +192,22 @@ class PutSellingStrategy:
         
         # Wait for WebSocket to fully initialize
         logger.info("Waiting for WebSocket to stabilize...")
-        time.sleep(5)
+        time.sleep(2)
         
         # Subscribe to account updates
-        self.ws_client.subscribe('act', self._handle_account_websocket)
-        logger.info("Subscribed to account updates")
+        #self.ws_client.subscribe_account_updates(self._handle_account_update)
         
-        # Subscribe to portfolio/position updates
-        self.ws_client.subscribe('pnl', self._handle_pnl_websocket)
-        logger.info("Subscribed to P&L updates")
+        # Subscribe to portfolio updates
+        #self.ws_client.subscribe_portfolio_updates(self._handle_portfolio_update)
         
         # Subscribe to order updates
-        self.ws_client.subscribe('ord', self._handle_order_websocket)
-        logger.info("Subscribed to order updates")
+        #self.ws_client.subscribe_order_updates(self._handle_order_update)
         
-        # Subscribe to system status messages
-        self.ws_client.subscribe('system', self._handle_system_websocket)
-        logger.info("Subscribed to system updates")
-        
-        # Subscribe to server status messages
-        self.ws_client.subscribe('sts', self._handle_server_status_websocket)
-        logger.info("Subscribed to server status")
-        
-        # Wait a bit more before subscribing to market data
+        # Wait before subscribing to market data
         logger.info("Waiting before subscribing to market data...")
-        time.sleep(5)
+        time.sleep(2)
         
-        # Subscribe to market data for all positions
+        # Subscribe to market data for positions
         self._subscribe_position_market_data()
     
     def _subscribe_position_market_data(self):
@@ -223,19 +222,17 @@ class PutSellingStrategy:
             
             logger.info(f"Total positions in portfolio: {len(options)}")
             
-            # Log all underlyers available
+            # Filter to debug symbol if specified
             if self.debug_symbol:
                 underlyers = set(opt.underlyer for opt in options)
                 logger.info(f"Available underlyers: {', '.join(sorted(underlyers))}")
-            
-            # Filter to debug symbol if specified
-            if self.debug_symbol:
+                
                 filtered_options = [opt for opt in options if opt.underlyer == self.debug_symbol]
                 logger.info(f"Filtering for {self.debug_symbol}: found {len(filtered_options)} position(s)")
                 
                 if not filtered_options:
                     logger.warning(f"❌ No positions found for debug symbol: {self.debug_symbol}")
-                    logger.warning(f"Available symbols: {', '.join(sorted(set(opt.underlyer for opt in options)))}")
+                    logger.warning(f"Available symbols: {', '.join(sorted(underlyers))}")
                     return
                 
                 options = filtered_options
@@ -243,93 +240,155 @@ class PutSellingStrategy:
             else:
                 logger.info(f"Subscribing to market data for all {len(options)} positions...")
             
-            # Subscribe to market data for each contract
-            # Pass the option's Book object directly - no callback needed!
-            subscribed = 0
-            failed = 0
-            for opt in options:
-                if not opt.conid:
-                    logger.warning(f"Skipping {opt.symbol} - no conid")
-                    continue
-                
-                logger.info(f"Subscribing to market data for {opt.symbol} (conid={opt.conid})...")
-                
-                # Pass the option's book object - it will be updated automatically
-                if self.ws_client.subscribe_market_data(opt.conid, opt.option_book):
-                    subscribed += 1
-                    logger.info(f"  ✓ Subscribed successfully")
-                else:
-                    failed += 1
-                    logger.warning(f"  ✗ Subscription failed")
-                
-                time.sleep(0.1)
-            
-            logger.info(f"Market data subscription summary: {subscribed} succeeded, {failed} failed")
+            # Use the simple interface - no need to know about topics or subscription details
+            subscribed, failed = self.ws_client.subscribe_all_position_market_data(options)
             
         except Exception as e:
             logger.error(f"Error subscribing to position market data: {e}", exc_info=True)
     
-    def _handle_system_websocket(self, data: Dict):
-        """Handle system message from WebSocket."""
-        # Filter out heartbeat messages
-        if 'hb' in data:
-            logger.debug(f"Heartbeat: {data.get('hb')}")
-            return
-        
-        logger.info(f"System update: {data}")
-        is_paper = data.get('isPaper', False)
-        username = data.get('success', 'unknown')
-        
-        if is_paper:
-            logger.warning(f"Connected to PAPER trading account: {username}")
-        else:
-            logger.info(f"Connected to LIVE trading account: {username}")
-    
-    def _handle_server_status_websocket(self, data: Dict):
-        """Handle server status message from WebSocket."""
-        args = data.get('args', {})
-        connected = args.get('connected', False)
-        authenticated = args.get('authenticated', False)
-        competing = args.get('competing', False)
-        
-        if not connected or not authenticated:
-            logger.warning(f"Server status issue - Connected: {connected}, Authenticated: {authenticated}")
-        
-        if competing:
-            logger.warning("Competing session detected - another connection is active")
-    
-    def _handle_account_websocket(self, data: Dict):
-        """Handle account update from WebSocket."""
-        logger.info("Account WebSocket update received")
-        # Account updates will trigger a portfolio refresh
+    def _handle_account_update(self, data: Dict):
+        """Handle account update."""
+        logger.info("Account update received")
         self._print_risk_report_async()
     
-    def _handle_pnl_websocket(self, data: Dict):
-        """Handle P&L/position update from WebSocket."""
-        logger.info("P&L WebSocket update received")
-        # Position updates will trigger a portfolio refresh
+    def _handle_portfolio_update(self, data: Dict):
+        """Handle portfolio update."""
+        logger.info("Portfolio update received")
         self._print_risk_report_async()
     
-    def _handle_order_websocket(self, data: Dict):
-        """Handle order update from WebSocket."""
-        logger.info(f"Order WebSocket update: {data}")
+    def _handle_order_update(self, data: Dict):
+        """Handle order update."""
+        logger.info(f"Order update: {data.get('status', 'unknown')}")
         status = data.get('status', '').lower()
         if status == 'filled':
-            logger.info("Order filled - position may have changed")
+            logger.info("Order filled - position changed")
             self._print_risk_report_async()
     
+    def _get_report_state(self) -> Dict:
+        """
+        Get current state for change detection.
+        
+        Returns:
+            Dictionary with key state values
+        """
+        with self.data_lock:
+            cash_info = self.current_cash_info
+            summary = self.portfolio.get_portfolio_summary()
+            
+            # Get position details
+            positions_state = []
+            for opt in self.portfolio.options:
+                positions_state.append({
+                    'symbol': str(opt),
+                    'quantity': opt.quantity,
+                    'strike': opt.strike,
+                    'expiry': opt.expiry,
+                    'bid': opt.option_book.bid,
+                    'ask': opt.option_book.ask,
+                })
+        
+        return {
+            'cash': cash_info,
+            'summary': summary,
+            'positions': positions_state,
+            'timestamp': datetime.now()
+        }
+    
+    def _has_state_changed(self, new_state: Dict) -> bool:
+        """
+        Check if report state has changed significantly.
+        
+        Args:
+            new_state: New state to compare
+            
+        Returns:
+            True if state has changed
+        """
+        with self.last_report_lock:
+            if self.last_report_state is None:
+                return True  # First time, always print
+            
+            old_state = self.last_report_state
+            
+            # Check if cash changed
+            if new_state['cash'] != old_state['cash']:
+                logger.debug("Cash info changed")
+                return True
+            
+            # Check if summary changed (position count, notional, etc.)
+            old_summary = old_state['summary']
+            new_summary = new_state['summary']
+            
+            if (old_summary['total_positions'] != new_summary['total_positions'] or
+                old_summary['total_notional'] != new_summary['total_notional'] or
+                old_summary['total_exercise_risk'] != new_summary['total_exercise_risk']):
+                logger.debug("Portfolio summary changed")
+                return True
+            
+            # Check if positions changed
+            old_positions = {p['symbol']: p for p in old_state['positions']}
+            new_positions = {p['symbol']: p for p in new_state['positions']}
+            
+            # Check for added/removed positions
+            if set(old_positions.keys()) != set(new_positions.keys()):
+                logger.debug("Positions added or removed")
+                return True
+            
+            # Check if any position details changed (quantity, strike, or prices)
+            for symbol, new_pos in new_positions.items():
+                old_pos = old_positions[symbol]
+                
+                # Check quantity or strike
+                if (old_pos['quantity'] != new_pos['quantity'] or
+                    old_pos['strike'] != new_pos['strike']):
+                    logger.debug(f"Position {symbol} details changed")
+                    return True
+                
+                # Check if prices changed significantly (more than $0.01)
+                if old_pos['bid'] is not None and new_pos['bid'] is not None:
+                    if abs(old_pos['bid'] - new_pos['bid']) > 0.01:
+                        logger.debug(f"Position {symbol} bid changed: {old_pos['bid']:.2f} -> {new_pos['bid']:.2f}")
+                        return True
+                
+                if old_pos['ask'] is not None and new_pos['ask'] is not None:
+                    if abs(old_pos['ask'] - new_pos['ask']) > 0.01:
+                        logger.debug(f"Position {symbol} ask changed: {old_pos['ask']:.2f} -> {new_pos['ask']:.2f}")
+                        return True
+            
+            # Check if too much time has passed (force refresh every 5 minutes)
+            time_since_last = (new_state['timestamp'] - old_state['timestamp']).total_seconds()
+            if time_since_last > 300:  # 5 minutes
+                logger.debug("Force refresh - 5 minutes elapsed")
+                return True
+            
+            return False
+    
     def _print_risk_report_async(self):
-        """Print risk report asynchronously."""
+        """Print risk report asynchronously only if state changed."""
         threading.Thread(target=self._print_risk_report_safe, daemon=True).start()
     
     def _print_risk_report_safe(self):
-        """Print risk report with proper locking."""
+        """Print risk report with proper locking and change detection."""
         try:
+            # Get current state
+            new_state = self._get_report_state()
+            
+            # Check if state changed
+            if not self._has_state_changed(new_state):
+                logger.debug("No significant changes, skipping report")
+                return
+            
+            # Update last state
+            with self.last_report_lock:
+                self.last_report_state = new_state
+            
+            # Print the report
             with self.data_lock:
                 cash_info = self.current_cash_info
                 short_puts = self.portfolio.short_puts.copy()
             
             if cash_info:
+                logger.info("State changed - printing risk report")
                 self.print_risk_report(short_puts, cash_info)
         except Exception as e:
             logger.error(f"Error printing risk report: {e}", exc_info=True)
@@ -481,53 +540,128 @@ class PutSellingStrategy:
         return self.risk_manager.check_new_put_order(strike, quantity, use_cash_limit=use_cash_limit)
     
     def monitor_positions(self):
-        """Monitor positions continuously using WebSocket or REST API polling."""
-        logger.info("=" * 80)
-        if self.ws_client and self.ws_client.is_connected:
-            logger.info("Starting REAL-TIME position monitor (WebSocket mode)")
-            logger.info("Updates arrive via WebSocket callbacks")
-            mode = 'websocket'
-        else:
-            logger.info("Starting position monitor (REST API polling mode)")
-            logger.info("Refreshing every 10 seconds")
-            mode = 'polling'
-        
-        logger.info("Press Ctrl+C to stop")
-        logger.info("=" * 80)
-        
-        self.running = True
-        
-        # Print initial report
-        cash_info = self.get_account_cash()
-        short_puts = self.get_short_put_positions()
-        if cash_info:
-            self.print_risk_report(short_puts, cash_info)
-        
+        """Monitor positions in real-time with periodic summary updates."""
         try:
-            if mode == 'websocket':
-                # WebSocket mode - just keep alive
-                while self.running:
+            self.running = True
+            logger.info("Starting real-time position monitoring...")
+            logger.info("Press Ctrl+C to stop")
+            
+            last_summary_time = 0
+            summary_interval = 5  # seconds
+            
+            while self.running:
+                try:
+                    current_time = time.time()
+                    
+                    # Print one-line summary every 5 seconds
+                    if current_time - last_summary_time >= summary_interval:
+                        self._print_one_line_summary()
+                        last_summary_time = current_time
+                    
                     time.sleep(1)
-            else:
-                # Polling mode - refresh periodically
-                while self.running:
-                    time.sleep(10)
-                    logger.info("Refreshing positions...")
-                    if self._load_initial_data():
-                        cash_info = self.get_account_cash()
-                        short_puts = self.get_short_put_positions()
-                        if cash_info:
-                            self.print_risk_report(short_puts, cash_info)
-                
-        except KeyboardInterrupt:
-            logger.info("\nStopping position monitor...")
-            self.running = False
+                    
+                except KeyboardInterrupt:
+                    logger.info("\nStopping monitoring...")
+                    self.running = False
+                    break
+                    
         except Exception as e:
-            logger.error(f"Error in position monitor: {e}", exc_info=True)
-            self.running = False
+            logger.error(f"Error in monitoring loop: {e}", exc_info=True)
         finally:
-            if self.ws_client and self.ws_client.is_connected:
+            self.running = False
+            if self.ws_client:
                 self.ws_client.disconnect()
+    
+    def _print_one_line_summary(self):
+        """Print a single-line portfolio summary."""
+        try:
+            with self.data_lock:
+                cash_info = self.current_cash_info
+                summary = self.portfolio.get_portfolio_summary()
+            
+            if not cash_info:
+                return
+            
+            settled_cash, buying_power, net_liq = cash_info
+            
+            # Calculate coverage ratio
+            coverage_ratio = 0
+            if summary['total_risk_adjusted_exercise'] > 0:
+                coverage_ratio = settled_cash / summary['total_risk_adjusted_exercise']
+            
+            # Build status indicator
+            if coverage_ratio < 1.0:
+                status = "⚠️  LOW"
+            elif coverage_ratio < 1.5:
+                status = "⚡ MED"
+            else:
+                status = "✅ GOOD"
+            
+            # Print single line with key metrics
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            print(f"{timestamp} | Pos: {summary['total_positions']:>3} ({summary['positions_with_delta']:>3} w/Δ) | "
+                  f"MaxEx: ${summary['total_max_exercise']:>11,.0f} | "
+                  f"RiskEx: ${summary['total_risk_adjusted_exercise']:>11,.0f} ({summary['risk_percentage']:>4.1f}%) | "
+                  f"Cash: ${settled_cash:>11,.0f} | "
+                  f"Coverage: {coverage_ratio:>4.2f}x {status}")
+            
+            # Check for high delta short puts that should be rolled
+            self._print_high_delta_positions()
+            
+        except Exception as e:
+            logger.error(f"Error printing summary: {e}", exc_info=True)
+    
+    def _print_high_delta_positions(self, delta_threshold: float = 0.5):
+        """
+        Print short puts with delta above threshold that should be considered for rolling.
+        
+        Args:
+            delta_threshold: Delta threshold (default: 0.5 means 50% probability of exercise)
+        """
+        try:
+            with self.data_lock:
+                short_puts = self.portfolio.short_puts
+            
+            # Find positions with high delta
+            high_delta_positions = []
+            for put in short_puts:
+                if put.delta is not None and abs(put.delta) > delta_threshold:
+                    high_delta_positions.append(put)
+            
+            if not high_delta_positions:
+                return
+            
+            # Sort by delta (highest risk first)
+            high_delta_positions.sort(key=lambda p: abs(p.delta), reverse=True)
+            
+            print(f"\n⚠️  HIGH DELTA SHORT PUTS - CONSIDER ROLLING ({len(high_delta_positions)} positions):")
+            print(f"{'Symbol':<10} {'Strike':<10} {'Expiry':<12} {'Days':<6} {'Delta':<8} {'Prob%':<7} {'Bid/Ask':<12} {'Action':<30}")
+            print("-" * 100)
+            
+            for put in high_delta_positions:
+                # Calculate next Friday
+                days_to_expiry = put.days_to_expiry
+                today = datetime.now().date()
+                days_until_friday = (4 - today.weekday()) % 7  # Friday is 4
+                if days_until_friday == 0:
+                    days_until_friday = 7  # If today is Friday, target next Friday
+                next_friday = today + timedelta(days=days_until_friday)
+                
+                # Suggest lower strike (5-10% below current)
+                suggested_strike = put.strike * 0.95
+                
+                prob_pct = abs(put.delta) * 100
+                bid_ask = f"${put.option_book.bid:.2f}/${put.option_book.ask:.2f}" if put.option_book.has_quotes else "N/A"
+                
+                action = f"Roll to {next_friday.strftime('%m/%d')} ${suggested_strike:.0f}"
+                
+                print(f"{put.underlyer:<10} ${put.strike:<9.2f} {put.expiry.strftime('%Y-%m-%d'):<12} "
+                      f"{days_to_expiry:<6} {put.delta:<8.3f} {prob_pct:<7.1f} {bid_ask:<12} {action:<30}")
+            
+            print()
+            
+        except Exception as e:
+            logger.error(f"Error printing high delta positions: {e}", exc_info=True)
     
     def analyze_positions_once(self, debug: bool = False):
         """Analyze current positions once and print report."""

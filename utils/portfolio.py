@@ -136,6 +136,51 @@ class OptionPortfolio:
         short_puts = self.short_puts
         long_puts = self.long_puts
         
+        # Calculate risk-adjusted exercise requirements
+        total_exercise_risk = 0
+        total_max_exercise = 0
+        positions_with_delta = 0
+        
+        for opt in self.options:
+            # Max exercise requirement (100% probability)
+            max_exercise = abs(opt.quantity) * opt.strike * opt.multiplier
+            total_max_exercise += max_exercise
+            
+            # Risk-adjusted exercise requirement
+            risk_amount = opt.get_exercise_risk_amount()
+            if risk_amount is not None:
+                total_exercise_risk += risk_amount
+                positions_with_delta += 1
+        
+        # Group by underlyer
+        by_underlyer = {}
+        for opt in self.options:
+            if opt.underlyer not in by_underlyer:
+                by_underlyer[opt.underlyer] = {
+                    'positions': 0,
+                    'notional': 0,
+                    'max_exercise': 0,
+                    'risk_adjusted_exercise': 0,
+                    'avg_delta': []
+                }
+            
+            by_underlyer[opt.underlyer]['positions'] += 1
+            by_underlyer[opt.underlyer]['notional'] += abs(opt.quantity) * opt.strike * opt.multiplier
+            by_underlyer[opt.underlyer]['max_exercise'] += abs(opt.quantity) * opt.strike * opt.multiplier
+            
+            risk_amount = opt.get_exercise_risk_amount()
+            if risk_amount is not None:
+                by_underlyer[opt.underlyer]['risk_adjusted_exercise'] += risk_amount
+                if opt.delta is not None:
+                    by_underlyer[opt.underlyer]['avg_delta'].append(abs(opt.delta))
+        
+        # Calculate average deltas per underlyer
+        for underlyer_data in by_underlyer.values():
+            if underlyer_data['avg_delta']:
+                underlyer_data['avg_delta'] = sum(underlyer_data['avg_delta']) / len(underlyer_data['avg_delta'])
+            else:
+                underlyer_data['avg_delta'] = None
+        
         return {
             'total_positions': len(self.options),
             'total_puts': len(self.all_puts),
@@ -145,29 +190,49 @@ class OptionPortfolio:
             'total_exercise_risk': self.get_total_exercise_risk(),
             'total_margin_requirement': self.get_total_margin_requirement(),
             'total_notional': sum(opt.notional_value for opt in self.options),
+            'total_max_exercise': total_max_exercise,
+            'total_risk_adjusted_exercise': total_exercise_risk,
+            'positions_with_delta': positions_with_delta,
+            'risk_percentage': (total_exercise_risk / total_max_exercise * 100) if total_max_exercise > 0 else 0,
+            'by_underlyer': by_underlyer,
         }
     
     def print_summary(self):
-        """Print portfolio summary."""
+        """Print portfolio summary with risk-adjusted exercise requirements."""
         summary = self.get_portfolio_summary()
         
-        print("\n" + "=" * 80)
-        print("OPTION PORTFOLIO SUMMARY")
-        print("=" * 80)
-        print(f"Total Positions:        {summary['total_positions']}")
-        print(f"  - Short Puts:         {summary['short_puts']}")
-        print(f"  - Long Puts:          {summary['long_puts']}")
-        print(f"Unique Underlyers:      {summary['underlyers']}")
-        print(f"\nRisk Metrics:")
-        print(f"  Exercise Risk:        ${summary['total_exercise_risk']:,.2f}")
-        print(f"  Margin Requirement:   ${summary['total_margin_requirement']:,.2f}")
-        print(f"  Total Notional:       ${summary['total_notional']:,.2f}")
-        print("=" * 80)
+        print("\n" + "=" * 100)
+        print("OPTION PORTFOLIO SUMMARY - RISK-ADJUSTED EXERCISE ANALYSIS")
+        print("=" * 100)
+        
+        print(f"\n📊 POSITIONS:")
+        print(f"  Total Positions:        {summary['total_positions']}")
+        print(f"  - Short Puts:           {summary['short_puts']}")
+        print(f"  - Long Puts:            {summary['long_puts']}")
+        print(f"  Unique Underlyers:      {summary['underlyers']}")
+        print(f"  Positions w/ Delta:     {summary['positions_with_delta']} / {summary['total_positions']}")
+        
+        print(f"\n💰 EXERCISE RISK ANALYSIS:")
+        print(f"  Max Exercise Req:       ${summary['total_max_exercise']:>15,.2f}  (100% probability)")
+        print(f"  Risk-Adj Exercise:      ${summary['total_risk_adjusted_exercise']:>15,.2f}  ({summary['risk_percentage']:.1f}% of max)")
+        print(f"  Traditional Risk:       ${summary['total_exercise_risk']:>15,.2f}  (legacy calc)")
+        
+        print(f"\n📈 OTHER METRICS:")
+        print(f"  Margin Requirement:     ${summary['total_margin_requirement']:>15,.2f}")
+        print(f"  Total Notional:         ${summary['total_notional']:>15,.2f}")
+        
+        # Show by underlyer
+        if summary['by_underlyer']:
+            print(f"\n📋 BREAKDOWN BY UNDERLYER:")
+            print(f"  {'Symbol':<10} {'Positions':<10} {'Notional':<15} {'Avg Delta':<12} {'Risk-Adj Req':<15}")
+            print(f"  {'-'*10} {'-'*10} {'-'*15} {'-'*12} {'-'*15}")
+            
+            for underlyer, data in sorted(summary['by_underlyer'].items()):
+                avg_delta_str = f"{data['avg_delta']:.3f}" if data['avg_delta'] is not None else "N/A"
+                print(f"  {underlyer:<10} {data['positions']:<10} ${data['notional']:>13,.2f} {avg_delta_str:<12} ${data['risk_adjusted_exercise']:>13,.2f}")
+        
+        print("\n" + "=" * 100)
     
     def __len__(self) -> int:
-        """Return number of positions."""
+        """Return the number of positions in the portfolio."""
         return len(self.options)
-    
-    def __iter__(self):
-        """Iterate over options."""
-        return iter(self.options)

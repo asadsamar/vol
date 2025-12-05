@@ -12,6 +12,7 @@ class IBKRMarketDataFields:
     LAST_PRICE = "31"
     BID_PRICE = "84"
     ASK_PRICE = "86"
+    CLOSE_PRICE = "7295"
     
     # Size fields
     LAST_SIZE = "7295"
@@ -23,10 +24,49 @@ class IBKRMarketDataFields:
     SYMBOL = "7219"
     EXCHANGE = "6119"
     
+    # Greeks
+    DELTA = "7308"          # Option Delta
+    GAMMA = "7309"          # Option Gamma
+    VEGA = "7310"           # Option Vega
+    THETA = "7311"          # Option Theta
+    
+    # Implied Volatility
+    IMPLIED_VOL = "7633"    # Implied Volatility
+    
+    # Option-specific fields
+    OPTION_VOLUME = "7762"  # Option Volume
+    UNDERLYING_PRICE = "7635"  # Underlying/Stock Price for options
+    
+    # Historical Volatility
+    HIST_VOL = "7084"       # Historical Volatility
+    HIST_VOL_CLOSE = "7087" # Historical Volatility (Close)
+    
     # Common field sets
     BASIC_QUOTES = [BID_PRICE, ASK_PRICE, LAST_PRICE]
-    FULL_QUOTES = [LAST_PRICE, BID_PRICE, ASK_PRICE, VOLUME, LAST_SIZE, BID_SIZE, ASK_SIZE, SYMBOL]
-    ALL_FIELDS = [LAST_PRICE, BID_PRICE, ASK_PRICE, VOLUME, LAST_SIZE, BID_SIZE, ASK_SIZE, SYMBOL, EXCHANGE]
+    
+    FULL_QUOTES = [
+        LAST_PRICE, BID_PRICE, ASK_PRICE, 
+        VOLUME, LAST_SIZE, BID_SIZE, ASK_SIZE, 
+        SYMBOL
+    ]
+    
+    OPTION_QUOTES = [
+        LAST_PRICE, BID_PRICE, ASK_PRICE,
+        BID_SIZE, ASK_SIZE, LAST_SIZE,
+        VOLUME, SYMBOL,
+        DELTA, GAMMA, VEGA, THETA,
+        IMPLIED_VOL, UNDERLYING_PRICE,
+        HIST_VOL
+    ]
+    
+    ALL_FIELDS = [
+        LAST_PRICE, BID_PRICE, ASK_PRICE, 
+        VOLUME, LAST_SIZE, BID_SIZE, ASK_SIZE, 
+        SYMBOL, EXCHANGE,
+        DELTA, GAMMA, VEGA, THETA,
+        IMPLIED_VOL, UNDERLYING_PRICE,
+        HIST_VOL, HIST_VOL_CLOSE, OPTION_VOLUME
+    ]
 
 
 class IBKRAccountFields:
