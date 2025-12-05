@@ -410,7 +410,8 @@ class IBWebAPIClient:
             return None
         
         try:
-            response = self.session.get(
+            response = self._make_request(
+                'GET',
                 f"{self.base_url}/portfolio/{account_id}/ledger"
             )
             response.raise_for_status()
@@ -420,6 +421,76 @@ class IBWebAPIClient:
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to get account ledger: {e}")
             return None
+    
+    def get_account_cash_summary(self, account_id: Optional[str] = None) -> Optional[Dict]:
+        """
+        Get a summary of account cash metrics including settled cash, buying power, and net liquidation value.
+        
+        Args:
+            account_id: The account ID to query (uses configured account if not provided)
+            
+        Returns:
+            Dictionary with keys: settled_cash, buying_power, net_liq_value, currency
+            Returns None if error
+        """
+        if account_id is None:
+            account_id = self.account_id
+        
+        if not account_id:
+            logger.error("No account ID provided and no account configured")
+            return None
+        
+        # Get ledger for cash balance
+        ledger = self.get_account_ledger(account_id)
+        if not ledger:
+            return None
+        
+        # Get account summary for buying power
+        summary = self.get_account_balance(account_id)
+        if not summary:
+            return None
+        
+        # Extract values from ledger (USD section)
+        settled_cash = 0.0
+        net_liq_value = 0.0
+        currency = 'USD'
+        
+        if 'USD' in ledger:
+            usd_data = ledger['USD']
+            settled_cash = float(usd_data.get('settledcash', 0))
+            net_liq_value = float(usd_data.get('netliquidationvalue', 0))
+            currency = usd_data.get('currency', 'USD')
+        
+        # Extract buying power from summary
+        # Summary format: {"buyingpower": {"amount": 1219857.0, ...}, ...}
+        buying_power = 0.0
+        
+        if isinstance(summary, dict):
+            # Look for buyingpower key
+            if 'buyingpower' in summary:
+                bp_data = summary['buyingpower']
+                if isinstance(bp_data, dict) and 'amount' in bp_data:
+                    buying_power = float(bp_data['amount'])
+            
+            # Alternative: look for availablefunds
+            if buying_power == 0.0 and 'availablefunds' in summary:
+                af_data = summary['availablefunds']
+                if isinstance(af_data, dict) and 'amount' in af_data:
+                    buying_power = float(af_data['amount'])
+        
+        result = {
+            'settled_cash': settled_cash,
+            'buying_power': buying_power,
+            'net_liq_value': net_liq_value,
+            'currency': currency
+        }
+        
+        logger.info(f"Account cash summary for {account_id}:")
+        logger.info(f"  Settled Cash: ${settled_cash:,.2f} {currency}")
+        logger.info(f"  Buying Power: ${buying_power:,.2f} {currency}")
+        logger.info(f"  Net Liquidation Value: ${net_liq_value:,.2f} {currency}")
+        
+        return result
     
     def get_positions(self, account_id: Optional[str] = None) -> Optional[List[Dict]]:
         """
