@@ -58,6 +58,7 @@ class Option:
         self.implied_vol: Optional[float] = None
         self.hist_vol: Optional[float] = None
         self.underlying_price: Optional[float] = None
+        self.spx_delta: Optional[float] = None  # SPX-normalized delta
         self.greeks_timestamp: Optional[float] = None
     
     def update_option_book(
@@ -111,6 +112,7 @@ class Option:
         implied_vol: Optional[float] = None,
         hist_vol: Optional[float] = None,
         underlying_price: Optional[float] = None,
+        spx_delta: Optional[float] = None,
         timestamp: Optional[float] = None
     ):
         """Update option Greeks and volatility data."""
@@ -128,6 +130,8 @@ class Option:
             self.hist_vol = hist_vol
         if underlying_price is not None:
             self.underlying_price = underlying_price
+        if spx_delta is not None:
+            self.spx_delta = spx_delta
         if timestamp is not None:
             self.greeks_timestamp = timestamp
     

@@ -560,6 +560,7 @@ class IBWebSocketClient:
             implied_vol = safe_float(data.get(IBKRMarketDataFields.IMPLIED_VOL))
             hist_vol = safe_float(data.get(IBKRMarketDataFields.HIST_VOL))
             underlying_price = safe_float(data.get(IBKRMarketDataFields.UNDERLYING_PRICE))
+            spx_delta = safe_float(data.get(IBKRMarketDataFields.SPX_DELTA))
             
             timestamp = data.get('_updated', time.time() * 1000) / 1000.0
             
@@ -584,7 +585,7 @@ class IBWebSocketClient:
                     timestamp=timestamp
                 )
                 
-                # Update the option's Greeks
+                # Update the option's Greeks (including SPX delta)
                 option.update_greeks(
                     delta=delta,
                     gamma=gamma,
@@ -593,6 +594,7 @@ class IBWebSocketClient:
                     implied_vol=implied_vol,
                     hist_vol=hist_vol,
                     underlying_price=underlying_price,
+                    spx_delta=spx_delta,
                     timestamp=timestamp
                 )
             

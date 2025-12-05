@@ -577,33 +577,12 @@ class PutSellingStrategy:
         try:
             with self.data_lock:
                 cash_info = self.current_cash_info
-                summary = self.portfolio.get_portfolio_summary()
             
             if not cash_info:
                 return
             
-            settled_cash, buying_power, net_liq = cash_info
-            
-            # Calculate coverage ratio
-            coverage_ratio = 0
-            if summary['total_risk_adjusted_exercise'] > 0:
-                coverage_ratio = settled_cash / summary['total_risk_adjusted_exercise']
-            
-            # Build status indicator
-            if coverage_ratio < 1.0:
-                status = "⚠️  LOW"
-            elif coverage_ratio < 1.5:
-                status = "⚡ MED"
-            else:
-                status = "✅ GOOD"
-            
-            # Print single line with key metrics
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            print(f"{timestamp} | Pos: {summary['total_positions']:>3} ({summary['positions_with_delta']:>3} w/Δ) | "
-                  f"MaxEx: ${summary['total_max_exercise']:>11,.0f} | "
-                  f"RiskEx: ${summary['total_risk_adjusted_exercise']:>11,.0f} ({summary['risk_percentage']:>4.1f}%) | "
-                  f"Cash: ${settled_cash:>11,.0f} | "
-                  f"Coverage: {coverage_ratio:>4.2f}x {status}")
+            # Let the portfolio handle its own summary
+            self.portfolio.print_one_line_summary(cash_info)
             
             # Check for high delta short puts that should be rolled
             self._print_high_delta_positions()

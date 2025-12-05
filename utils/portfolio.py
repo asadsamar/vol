@@ -1,7 +1,7 @@
 """
 Portfolio management with option position tracking.
 """
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 import logging
 
@@ -141,6 +141,11 @@ class OptionPortfolio:
         total_max_exercise = 0
         positions_with_delta = 0
         
+        # Calculate portfolio-level SPX delta
+        # Note: IBKR sends position-level SPX delta (already multiplied by quantity)
+        portfolio_spx_delta = 0
+        positions_with_spx_delta = 0
+        
         for opt in self.options:
             # Max exercise requirement (100% probability)
             max_exercise = abs(opt.quantity) * opt.strike * opt.multiplier
@@ -151,6 +156,12 @@ class OptionPortfolio:
             if risk_amount is not None:
                 total_exercise_risk += risk_amount
                 positions_with_delta += 1
+            
+            # Portfolio SPX delta - IBKR already accounts for position quantity
+            # Just sum them up directly
+            if opt.spx_delta is not None:
+                portfolio_spx_delta += opt.spx_delta
+                positions_with_spx_delta += 1
         
         # Group by underlyer
         by_underlyer = {}
@@ -161,7 +172,8 @@ class OptionPortfolio:
                     'notional': 0,
                     'max_exercise': 0,
                     'risk_adjusted_exercise': 0,
-                    'avg_delta': []
+                    'avg_delta': [],
+                    'portfolio_spx_delta': 0
                 }
             
             by_underlyer[opt.underlyer]['positions'] += 1
@@ -173,6 +185,10 @@ class OptionPortfolio:
                 by_underlyer[opt.underlyer]['risk_adjusted_exercise'] += risk_amount
                 if opt.delta is not None:
                     by_underlyer[opt.underlyer]['avg_delta'].append(abs(opt.delta))
+            
+            # Add to underlyer SPX delta - already position-level from IBKR
+            if opt.spx_delta is not None:
+                by_underlyer[opt.underlyer]['portfolio_spx_delta'] += opt.spx_delta
         
         # Calculate average deltas per underlyer
         for underlyer_data in by_underlyer.values():
@@ -193,7 +209,9 @@ class OptionPortfolio:
             'total_max_exercise': total_max_exercise,
             'total_risk_adjusted_exercise': total_exercise_risk,
             'positions_with_delta': positions_with_delta,
+            'positions_with_spx_delta': positions_with_spx_delta,
             'risk_percentage': (total_exercise_risk / total_max_exercise * 100) if total_max_exercise > 0 else 0,
+            'portfolio_spx_delta': portfolio_spx_delta,
             'by_underlyer': by_underlyer,
         }
     
@@ -232,6 +250,44 @@ class OptionPortfolio:
                 print(f"  {underlyer:<10} {data['positions']:<10} ${data['notional']:>13,.2f} {avg_delta_str:<12} ${data['risk_adjusted_exercise']:>13,.2f}")
         
         print("\n" + "=" * 100)
+    
+    def print_one_line_summary(self, cash_info: Tuple[float, float, float]):
+        """
+        Print a single-line portfolio summary.
+        
+        Args:
+            cash_info: Tuple of (settled_cash, buying_power, net_liquidation)
+        """
+        try:
+            settled_cash, buying_power, net_liq = cash_info
+            summary = self.get_portfolio_summary()
+            
+            # Calculate coverage ratio
+            coverage_ratio = 0
+            if summary['total_risk_adjusted_exercise'] > 0:
+                coverage_ratio = settled_cash / summary['total_risk_adjusted_exercise']
+            
+            # Build status indicator
+            if coverage_ratio < 1.0:
+                status = "⚠️  LOW"
+            elif coverage_ratio < 1.5:
+                status = "⚡ MED"
+            else:
+                status = "✅ GOOD"
+            
+            # Format SPX delta
+            spx_delta = summary['portfolio_spx_delta']
+            
+            # Print single line with key metrics
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            print(f"{timestamp} | Pos: {summary['total_positions']:>3} ({summary['positions_with_delta']:>3} w/Δ) | "
+                  f"SPX-Δ: {spx_delta:>8,.2f} ({summary['positions_with_spx_delta']:>2}) | "
+                  f"RiskEx: ${summary['total_risk_adjusted_exercise']:>11,.0f} ({summary['risk_percentage']:>4.1f}%) | "
+                  f"Cash: ${settled_cash:>11,.0f} | Cov: {coverage_ratio:>4.2f}x {status}")
+            
+        except Exception as e:
+            logger.error(f"Error printing one-line summary: {e}", exc_info=True)
     
     def __len__(self) -> int:
         """Return the number of positions in the portfolio."""

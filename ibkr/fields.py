@@ -36,6 +36,7 @@ class IBKRMarketDataFields:
     # Option-specific fields
     OPTION_VOLUME = "7762"  # Option Volume
     UNDERLYING_PRICE = "7635"  # Underlying/Stock Price for options
+    SPX_DELTA = "7696"      # SPX Delta (normalized delta relative to SPX)
     
     # Historical Volatility
     HIST_VOL = "7084"       # Historical Volatility
@@ -56,7 +57,7 @@ class IBKRMarketDataFields:
         VOLUME, SYMBOL,
         DELTA, GAMMA, VEGA, THETA,
         IMPLIED_VOL, UNDERLYING_PRICE,
-        HIST_VOL
+        HIST_VOL, SPX_DELTA
     ]
     
     ALL_FIELDS = [
@@ -65,7 +66,8 @@ class IBKRMarketDataFields:
         SYMBOL, EXCHANGE,
         DELTA, GAMMA, VEGA, THETA,
         IMPLIED_VOL, UNDERLYING_PRICE,
-        HIST_VOL, HIST_VOL_CLOSE, OPTION_VOLUME
+        HIST_VOL, HIST_VOL_CLOSE, OPTION_VOLUME,
+        SPX_DELTA
     ]
 
 
