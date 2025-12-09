@@ -56,7 +56,7 @@ class Option:
         self.vega: Optional[float] = None
         self.theta: Optional[float] = None
         self.implied_vol: Optional[float] = None
-        self.hist_vol: Optional[float] = None
+        self.ivr: Optional[float] = None  # Implied Volatility Rank
         self.underlying_price: Optional[float] = None
         self.spx_delta: Optional[float] = None  # SPX-normalized delta
         self.greeks_timestamp: Optional[float] = None
@@ -110,7 +110,7 @@ class Option:
         vega: Optional[float] = None,
         theta: Optional[float] = None,
         implied_vol: Optional[float] = None,
-        hist_vol: Optional[float] = None,
+        ivr: Optional[float] = None,
         underlying_price: Optional[float] = None,
         spx_delta: Optional[float] = None,
         timestamp: Optional[float] = None
@@ -126,8 +126,8 @@ class Option:
             self.theta = theta
         if implied_vol is not None:
             self.implied_vol = implied_vol
-        if hist_vol is not None:
-            self.hist_vol = hist_vol
+        if ivr is not None:
+            self.ivr = ivr
         if underlying_price is not None:
             self.underlying_price = underlying_price
         if spx_delta is not None:

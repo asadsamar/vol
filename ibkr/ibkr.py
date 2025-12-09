@@ -230,7 +230,7 @@ class IBWebAPIClient:
         """
         try:
             # Check authentication status
-            response = self.session.get(f"{self.base_url}/iserver/auth/status")
+            response = self._make_request('GET', f"{self.base_url}/iserver/auth/status")
             response.raise_for_status()
             
             auth_status = response.json()
@@ -299,7 +299,7 @@ class IBWebAPIClient:
             List of account dictionaries
         """
         try:
-            response = self.session.get(f"{self.base_url}/portfolio/accounts")
+            response = self._make_request('GET', f"{self.base_url}/portfolio/accounts")
             response.raise_for_status()
             accounts = response.json()
             return accounts
@@ -307,53 +307,13 @@ class IBWebAPIClient:
             logger.error(f"Failed to get accounts: {e}")
             return None
     
-    def get_accounts(self) -> Optional[List[str]]:
-        """
-        Get list of available account IDs.
-        
-        Returns:
-            List of account ID strings
-        """
-        if self.available_accounts:
-            return [acc['accountId'] for acc in self.available_accounts]
-        
-        accounts_response = self._fetch_accounts()
-        if accounts_response:
-            self.available_accounts = accounts_response
-            return [acc['accountId'] for acc in accounts_response]
-        
-        return None
-    
-    def get_account_info(self, account_id: Optional[str] = None) -> Optional[Dict]:
-        """
-        Get detailed information about an account.
-        
-        Args:
-            account_id: Account ID (uses configured account if not provided)
-            
-        Returns:
-            Dictionary with account information
-        """
-        if account_id is None:
-            account_id = self.account_id
-        
-        if not account_id:
-            logger.error("No account ID provided and no account configured")
-            return None
-        
-        for acc in self.available_accounts:
-            if acc['accountId'] == account_id:
-                return acc
-        
-        return None
-    
     def tickle(self) -> bool:
         """
         Keep the session alive by calling the tickle endpoint.
         Should be called periodically to maintain connection.
         """
         try:
-            response = self.session.post(f"{self.base_url}/tickle")
+            response = self._make_request('POST', f"{self.base_url}/tickle")
             response.raise_for_status()
             result = response.json()
             logger.info(f"Session tickle: {result}")
@@ -381,7 +341,8 @@ class IBWebAPIClient:
         
         try:
             # Get account summary
-            response = self.session.get(
+            response = self._make_request(
+                'GET',
                 f"{self.base_url}/portfolio/{account_id}/summary"
             )
             response.raise_for_status()
@@ -510,7 +471,8 @@ class IBWebAPIClient:
             return None
         
         try:
-            response = self.session.get(
+            response = self._make_request(
+                'GET',
                 f"{self.base_url}/portfolio/{account_id}/positions/0"
             )
             response.raise_for_status()
@@ -558,63 +520,174 @@ class IBWebAPIClient:
             summary['positions'].append(position_info)
         
         return summary
-
-
-def main():
-    """
-    Example usage of the IB Web API Client
-    """
-    # Initialize client
-    client = IBWebAPIClient()
     
-    print("=" * 60)
-    print("Interactive Brokers Web API - Account Balance Example")
-    print("=" * 60)
-    
-    # Step 1: Check authentication
-    print("\n1. Checking authentication...")
-    if not client.authenticate():
-        print("\nPlease complete these steps:")
-        print("1. Download Client Portal Gateway from:")
-        print("   https://www.interactivebrokers.com/en/trading/cpgw.php")
-        print("2. Start the gateway application")
-        print("3. Open https://localhost:5000 in your browser")
-        print("4. Log in with your IB credentials")
-        print("5. Run this script again")
-        return
-    
-    # Step 2: Keep session alive
-    print("\n2. Keeping session alive...")
-    client.tickle()
-    
-    # Step 3: Get available accounts
-    print("\n3. Retrieving accounts...")
-    accounts = client.get_accounts()
-    
-    if not accounts:
-        print("No accounts found or error occurred")
-        return
-    
-    print(f"\nFound {len(accounts)} account(s)")
-    
-    # Step 4: Get balance for each account
-    for account_id in accounts:
-        print(f"\n{'=' * 60}")
-        print(f"Account: {account_id}")
-        print(f"{'=' * 60}")
+    def get_stock_price(
+        self,
+        symbol: str,
+        exchange: str = 'SMART'
+    ) -> Optional[float]:
+        """
+        Get current stock price for a symbol.
         
-        # Get account summary
-        print("\nAccount Summary:")
-        balance = client.get_account_balance(account_id)
-        if balance:
-            print(json.dumps(balance, indent=2))
+        Args:
+            symbol: Stock ticker symbol
+            exchange: Exchange (default: SMART for best execution)
+            
+        Returns:
+            Current stock price or None if not available
+        """
+        try:
+            logger.info(f"Getting price for {symbol}...")
+            
+            # Search for the contract
+            contracts = self.search_contracts(symbol)
+            if not contracts:
+                logger.warning(f"No contracts found for {symbol}")
+                return None
+            
+            logger.info(f"Found {len(contracts)} contracts for {symbol}")
+            
+            # Find the primary stock contract
+            stock_contract = None
+            for contract in contracts:
+                sections = contract.get('sections', [])
+                has_stock = any(section.get('secType') == 'STK' for section in sections)
+                
+                if has_stock and contract.get('symbol') == symbol:
+                    description = contract.get('description', '')
+                    # Prefer NYSE or NASDAQ
+                    if 'NYSE' in description or 'NASDAQ' in description:
+                        stock_contract = contract
+                        logger.info(f"Found primary stock contract: {description}")
+                        break
+                    elif not stock_contract:
+                        stock_contract = contract
+            
+            if not stock_contract:
+                logger.warning(f"No stock contract found for {symbol}")
+                return None
+            
+            conid = stock_contract.get('conid')
+            if not conid:
+                logger.warning(f"No conid found for {symbol}")
+                return None
+            
+            logger.info(f"Getting market data for {symbol} (conid: {conid}, exchange: {exchange})")
+            
+            # Get market data
+            snapshot = self.get_market_data_snapshot(conid, fields=['31', '84', '86', '87'])
+            
+            if not snapshot:
+                logger.warning(f"No market data snapshot for {symbol}")
+                return None
+            
+            # Try to extract price from various fields
+            # Priority: last price (31) > bid (84)
+            last_price = snapshot.get('31')
+            bid = snapshot.get('84')
+            
+            def to_float(val):
+                if val is None:
+                    return None
+                try:
+                    if isinstance(val, str):
+                        # Remove 'C' prefix and commas
+                        val = val.lstrip('CH').replace(',', '')
+                    return float(val)
+                except (ValueError, TypeError):
+                    return None
+            
+            price = to_float(last_price)
+            if price is None:
+                price = to_float(bid)
+            
+            if price is not None:
+                logger.info(f"Got price for {symbol}: ${price:.2f} (last/close)")
+                return price
+            else:
+                logger.warning(f"No valid price data for {symbol}")
+                logger.warning(f"Snapshot contained: {snapshot}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error getting price for {symbol}: {e}", exc_info=True)
+            return None
+    
+    def search_contracts(self, symbol: str) -> Optional[List[Dict]]:
+        """
+        Search for contracts by symbol.
         
-        # Get detailed ledger
-        print("\nAccount Ledger:")
-        ledger = client.get_account_ledger(account_id)
-        if ledger:
-            print(json.dumps(ledger, indent=2))
-
-
-if __name__ == "__main__":
-    main()
+        Args:
+            symbol: The symbol to search for
+            
+        Returns:
+            List of matching contracts
+        """
+        try:
+            params = {'symbol': symbol}
+            response = self._make_request(
+                'GET',
+                f"{self.base_url}/iserver/secdef/search",
+                params=params
+            )
+            response.raise_for_status()
+            contracts = response.json()
+            
+            if not contracts:
+                logger.debug(f"No contracts found for symbol: {symbol}")
+                return []
+            
+            logger.debug(f"Found {len(contracts)} contract(s) for {symbol}")
+            return contracts
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to search contracts for {symbol}: {e}")
+            return None
+    
+    def get_market_data_snapshot(
+        self,
+        conid: int,
+        fields: Optional[List[str]] = None
+    ) -> Optional[Dict]:
+        """
+        Get market data snapshot for a contract.
+        
+        Args:
+            conid: Contract ID
+            fields: List of field IDs to request (e.g., ['84', '86'] for bid/ask)
+            
+        Returns:
+            Dictionary of field values, or None if failed
+        """
+        url = f"{self.base_url}/iserver/marketdata/snapshot"
+        
+        # Build fields parameter
+        if fields:
+            fields_str = ','.join(str(f) for f in fields)
+        else:
+            # Default fields if none specified
+            fields_str = '31,84,86,87'  # Last, Bid, Ask, Volume
+        
+        params = {
+            'conids': str(conid),
+            'fields': fields_str
+        }
+        
+        try:
+            response = self._make_request('GET', url, params=params)
+            
+            if response.status_code != 200:
+                logger.warning(f"Market data request failed: {response.status_code}")
+                return None
+            
+            data = response.json()
+            
+            if not data or not isinstance(data, list) or len(data) == 0:
+                logger.debug(f"No data in market snapshot response")
+                return None
+            
+            return data[0]
+                
+        except Exception as e:
+            logger.error(f"Error getting market data: {e}")
+            return None

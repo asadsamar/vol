@@ -558,7 +558,7 @@ class IBWebSocketClient:
             
             # Extract volatility fields
             implied_vol = safe_float(data.get(IBKRMarketDataFields.IMPLIED_VOL))
-            hist_vol = safe_float(data.get(IBKRMarketDataFields.HIST_VOL))
+            ivr = safe_float(data.get(IBKRMarketDataFields.IVR))
             underlying_price = safe_float(data.get(IBKRMarketDataFields.UNDERLYING_PRICE))
             spx_delta = safe_float(data.get(IBKRMarketDataFields.SPX_DELTA))
             
@@ -585,14 +585,14 @@ class IBWebSocketClient:
                     timestamp=timestamp
                 )
                 
-                # Update the option's Greeks (including SPX delta)
+                # Update the option's Greeks (including SPX delta and IVR)
                 option.update_greeks(
                     delta=delta,
                     gamma=gamma,
                     vega=vega,
                     theta=theta,
                     implied_vol=implied_vol,
-                    hist_vol=hist_vol,
+                    ivr=ivr,
                     underlying_price=underlying_price,
                     spx_delta=spx_delta,
                     timestamp=timestamp
