@@ -30,7 +30,7 @@ sys.path.insert(0, vol_dir)
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -45,12 +45,13 @@ class ScannerConfig:
     indices: List[str]
     min_ivr: float
     strike_pct_below: float
-    target_delta: float  # Changed from max_delta
+    target_delta: float
     check_200d_mavg: bool
     max_symbols: int = 0  # 0 = no limit
     days_to_expiry: Optional[int] = None
     min_premium: Optional[float] = None
     min_volume: Optional[int] = None
+    min_annualized_return: Optional[float] = None  # New field
     top_n: int = 20
     
     @classmethod
@@ -76,7 +77,7 @@ class ScannerConfig:
         # Required parameters
         min_ivr = scan_section.getfloat('min_ivr', 50.0)
         strike_pct_below = scan_section.getfloat('strike_pct_below', 5.0)
-        target_delta = scan_section.getfloat('target_delta', 0.20)  # Changed from max_delta
+        target_delta = scan_section.getfloat('target_delta', 0.20)
         check_200d_mavg = scan_section.getboolean('check_200d_mavg', False)
         max_symbols = scan_section.getint('max_symbols', 0)
         
@@ -84,6 +85,7 @@ class ScannerConfig:
         days_to_expiry = scan_section.getint('days_to_expiry', fallback=None)
         min_premium = scan_section.getfloat('min_premium', fallback=None)
         min_volume = scan_section.getint('min_volume', fallback=None)
+        min_annualized_return = scan_section.getfloat('min_annualized_return', fallback=None)  # New
         top_n = scan_section.getint('top_n', 20)
         
         return cls(
@@ -96,23 +98,34 @@ class ScannerConfig:
             days_to_expiry=days_to_expiry,
             min_premium=min_premium,
             min_volume=min_volume,
+            min_annualized_return=min_annualized_return,  # New
             top_n=top_n
         )
     
     def __str__(self) -> str:
         """String representation of config."""
         max_sym_str = f"{self.max_symbols}" if self.max_symbols > 0 else "unlimited"
-        return (f"Scanner Config:\n"
-                f"  Indices: {', '.join(self.indices)}\n"
-                f"  Max Symbols: {max_sym_str}\n"
-                f"  Min IVR: {self.min_ivr:.1f}\n"
-                f"  Strike: {self.strike_pct_below:.1f}% below current price\n"
-                f"  Target Delta: {self.target_delta:.2f}\n"
-                f"  Check 200D MA: {self.check_200d_mavg}\n"
-                f"  Days to Expiry: {self.days_to_expiry if self.days_to_expiry else 'Next Friday'}\n"
-                f"  Min Premium: ${self.min_premium:.2f}" if self.min_premium else "  Min Premium: None\n"
-                f"  Min Volume: {self.min_volume}" if self.min_volume else "  Min Volume: None\n"
-                f"  Top N: {self.top_n}")
+        lines = [
+            "Scanner Config:",
+            f"  Indices: {', '.join(self.indices)}",
+            f"  Max Symbols: {max_sym_str}",
+            f"  Min IVR: {self.min_ivr:.1f}%",
+            f"  Strike: {self.strike_pct_below:.1f}% below current price",
+            f"  Target Delta: {self.target_delta:.2f}",
+            f"  Check 200D MA: {self.check_200d_mavg}",
+            f"  Days to Expiry: {self.days_to_expiry if self.days_to_expiry else 'Next Friday'}",
+        ]
+        
+        if self.min_premium:
+            lines.append(f"  Min Premium: ${self.min_premium:.2f}")
+        if self.min_volume:
+            lines.append(f"  Min Volume: {self.min_volume}")
+        if self.min_annualized_return:
+            lines.append(f"  Min Annualized Return: {self.min_annualized_return:.1f}%")
+        
+        lines.append(f"  Top N: {self.top_n}")
+        
+        return "\n".join(lines)
 
 
 class PutScannerStrategy:
@@ -198,6 +211,13 @@ class PutScannerStrategy:
         if self.scan_config.min_premium is not None:
             if result.mid is None or result.mid < self.scan_config.min_premium:
                 logger.debug(f"  Filtered out {result.symbol}: Premium ${result.mid} < ${self.scan_config.min_premium}")
+                return False
+        
+        # Min annualized return filter
+        if self.scan_config.min_annualized_return is not None:
+            if result.annualized_return is None or result.annualized_return < self.scan_config.min_annualized_return:
+                ann_ret_str = f"{result.annualized_return:.1f}%" if result.annualized_return else "N/A"
+                logger.debug(f"  Filtered out {result.symbol}: Ann. Return {ann_ret_str} < {self.scan_config.min_annualized_return:.1f}%")
                 return False
         
         # TODO: Add volume filter when we get volume data
@@ -320,25 +340,26 @@ class PutScannerStrategy:
         # Sort by IVR
         combined.sort(key=lambda x: x[1].ivr if x[1].ivr else -1, reverse=True)
         
-        print("\n" + "=" * 120)
+        print("\n" + "=" * 140)
         print(f"TOP {min(top_n, len(combined))} OPPORTUNITIES ACROSS ALL INDICES")
-        print("=" * 120)
+        print("=" * 140)
         print(f"{'Index':<6} | {'Symbol':<6} | {'Price':<8} | {'Strike':<8} | {'OTM%':<6} | "
-              f"{'DTE':<4} | {'IVR':<5} | {'IV':<7} | {'Delta':<7} | {'Mid':<8}")
-        print("-" * 120)
+              f"{'DTE':<4} | {'IVR':<5} | {'IV':<7} | {'Delta':<7} | {'Mid':<8} | {'Ann.Ret':<8}")
+        print("-" * 140)
         
         for i, (index, result) in enumerate(combined[:top_n]):
             ivr_str = f"{result.ivr:.1f}" if result.ivr is not None else "N/A"
             iv_str = f"{result.implied_vol:.1%}" if result.implied_vol is not None else "N/A"
             delta_str = f"{result.delta:.3f}" if result.delta is not None else "N/A"
             mid_str = f"${result.mid:.2f}" if result.mid is not None else "N/A"
+            ann_ret_str = f"{result.annualized_return:.1f}%" if result.annualized_return is not None else "N/A"
             
             print(f"{index:<6} | {result.symbol:<6} | ${result.current_price:>6.2f} | "
                   f"${result.strike:>6.2f} | {result.strike_pct_otm:>5.1f}% | "
                   f"{result.days_to_expiry:>3} | {ivr_str:>5} | {iv_str:>7} | "
-                  f"{delta_str:>7} | {mid_str:>8}")
+                  f"{delta_str:>7} | {mid_str:>8} | {ann_ret_str:>8}")
         
-        print("=" * 120)
+        print("=" * 140)
     
     def run(self):
         """Main execution method."""
@@ -372,10 +393,20 @@ class PutScannerStrategy:
                         all_combined.append((index, result))
                 all_combined.sort(key=lambda x: x[1].ivr if x[1].ivr else -1, reverse=True)
                 
+                # Print top opportunities
                 logger.info("\nTop 5 opportunities by IVR:")
-                for i, (index, result) in enumerate(all_combined[:5], 1):
-                    logger.info(f"  {i}. [{index}] {result.symbol} - IVR: {result.ivr:.1f}, "
-                              f"Strike: ${result.strike:.2f}, Premium: ${result.mid:.2f if result.mid else 0:.2f}")
+                for i, (index, result) in enumerate(all_combined[:5], 1):  # Unpack the tuple here
+                    # Handle None values in formatting
+                    ivr_str = f"{result.ivr:.1f}%" if result.ivr is not None else "N/A"
+                    iv_str = f"{result.implied_vol:.1%}" if result.implied_vol is not None else "N/A"
+                    delta_str = f"{abs(result.delta):.3f}" if result.delta is not None else "N/A"
+                    mid_str = f"${result.mid:.2f}" if result.mid is not None else "N/A"
+                    
+                    logger.info(
+                        f"  {i}. [{index}] {result.symbol} ${result.strike:.0f}P - "
+                        f"IVR: {ivr_str}, IV: {iv_str}, Δ: {delta_str}, "
+                        f"Premium: {mid_str}, DTE: {result.days_to_expiry}"
+                    )
             else:
                 logger.warning("No opportunities found matching criteria")
             

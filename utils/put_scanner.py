@@ -12,9 +12,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PutScanResult:
-    """Represents a scan result for a put option."""
+    """Result from put scanner."""
     symbol: str
-    stock_price: float  # Changed from current_price
+    stock_price: float
     strike: float
     expiry: date
     bid: Optional[float]
@@ -29,25 +29,68 @@ class PutScanResult:
     volume: Optional[float]
     
     @property
+    def current_price(self) -> float:
+        """Alias for stock_price to match usage."""
+        return self.stock_price
+    
+    @property
     def days_to_expiry(self) -> int:
         """Calculate days to expiry."""
         return (self.expiry - date.today()).days
     
     @property
     def strike_pct_otm(self) -> float:
-        """Calculate percentage OTM."""
+        """Calculate percentage strike is OTM."""
         return ((self.stock_price - self.strike) / self.stock_price) * 100
     
-    def __str__(self) -> str:
-        ivr_str = f"{self.ivr:.1f}" if self.ivr is not None else "N/A"
-        iv_str = f"{self.implied_vol:.1%}" if self.implied_vol is not None else "N/A"
-        delta_str = f"{abs(self.delta):.3f}" if self.delta is not None else "N/A"
-        mid_str = f"${self.mid:.2f}" if self.mid is not None else "N/A"
+    @property
+    def annualized_return(self) -> Optional[float]:
+        """
+        Calculate annualized return for cash-secured put.
         
-        return (f"{self.symbol:<6} | Price: ${self.stock_price:>7.2f} | "
-                f"Strike: ${self.strike:>7.2f} ({self.strike_pct_otm:>5.1f}% OTM) | "
-                f"DTE: {self.days_to_expiry:>2} | IVR: {ivr_str:>5} | "
-                f"IV: {iv_str:>6} | Δ: {delta_str:>6} | Mid: {mid_str:>7}")
+        Return = (Premium / Strike) * (365 / DTE) * 100
+        
+        This assumes:
+        - Cash-secured put (collateral = strike price)
+        - Premium is profit if not assigned
+        - Annualized for comparison across different DTEs
+        """
+        if self.mid is None or self.strike is None:
+            return None
+        
+        dte = self.days_to_expiry
+        if dte <= 0:
+            return None
+        
+        # Return on collateral (strike price)
+        return_pct = (self.mid / self.strike) * 100
+        
+        # Annualize
+        annualized = return_pct * (365 / dte)
+        
+        return annualized
+    
+    def __str__(self) -> str:
+        """String representation."""
+        parts = [
+            f"{self.symbol} ${self.strike:.0f}P",
+            f"expires {self.expiry.strftime('%Y-%m-%d')} ({self.days_to_expiry}d)"
+        ]
+        
+        if self.bid is not None and self.ask is not None:
+            parts.append(f"${self.bid:.2f}/${self.ask:.2f}")
+        if self.mid is not None:
+            parts.append(f"mid=${self.mid:.2f}")
+        if self.delta is not None:
+            parts.append(f"Δ={self.delta:.3f}")
+        if self.implied_vol is not None:
+            parts.append(f"IV={self.implied_vol:.1%}")
+        if self.ivr is not None:
+            parts.append(f"IVR={self.ivr:.1f}%")
+        if self.annualized_return is not None:
+            parts.append(f"Ann.Ret={self.annualized_return:.1f}%")
+        
+        return " | ".join(parts)
 
 
 class PutScanner:
@@ -389,11 +432,17 @@ class PutScanner:
                 tested_count = 0
                 
                 for i, strike in enumerate(candidates[:20]):
-                    option_result = self._get_option_data(
-                        stock_conid, month_format, strike, expiry_date, stock_ivhv  # Pass stock_ivhv here
+                    option_result = self.client.get_option_data(
+                        stock_conid=stock_conid,
+                        strike=strike,
+                        expiry_date=expiry_date,
+                        right='P'
                     )
                     
                     if option_result and option_result.get('delta') is not None:
+                        # Add stock-level IV/HV to the result
+                        option_result['ivr'] = stock_ivhv
+                        
                         abs_delta = abs(option_result['delta'])
                         delta_diff = abs(abs_delta - target_delta)
                         tested_count += 1
@@ -440,139 +489,23 @@ class PutScanner:
             else:
                 # Original behavior: use strike closest to target price
                 closest_strike = min(float_strikes, key=lambda x: abs(x - target_strike))
-                result = self._get_option_data(stock_conid, month_format, closest_strike, expiry_date, stock_ivhv)  # Pass stock_ivhv here too
-                if not result:
+                result = self.client.get_option_data(
+                    stock_conid=stock_conid,
+                    strike=closest_strike,
+                    expiry_date=expiry_date,
+                    right='P'
+                )
+                
+                if result:
+                    # Add stock-level IV/HV to the result
+                    result['ivr'] = stock_ivhv
+                    return result
+                else:
                     logger.debug(f"  Reason: Could not get option data for strike ${closest_strike:.0f}")
-                return result
+                    return None
             
         except Exception as e:
             logger.debug(f"  Reason: Exception - {str(e)}")
-            return None
-    
-    def _get_option_data(
-        self,
-        stock_conid: int,
-        month_format: str,
-        strike: float,
-        expiry_date: date,
-        stock_ivhv: Optional[float] = None
-    ) -> Optional[Dict]:
-        """
-        Get option market data for a specific strike.
-        
-        Args:
-            stock_conid: Stock contract ID
-            month_format: Month format string for API
-            strike: Strike price
-            expiry_date: Expiration date
-            stock_ivhv: IV/HV ratio from underlying stock (optional)
-            
-        Returns:
-            Dictionary with option data
-        """
-        try:
-            # Get the specific option contract
-            option_params = {
-                'conid': stock_conid,
-                'sectype': 'OPT',
-                'month': month_format,
-                'exchange': 'SMART',
-                'strike': str(strike),
-                'right': 'P'
-            }
-            
-            secdef_url = f"{self.client.base_url}/iserver/secdef/info"
-            secdef_response = self.client._make_request('GET', secdef_url, params=option_params)
-            
-            if secdef_response.status_code != 200:
-                logger.debug(f"Failed to get option contract: status {secdef_response.status_code}")
-                return None
-            
-            option_data = secdef_response.json()
-            
-            # Find contract with matching expiry
-            option_conid = None
-            target_expiry_str = expiry_date.strftime('%Y%m%d')
-            
-            if isinstance(option_data, list):
-                for contract in option_data:
-                    contract_expiry = contract.get('maturityDate')
-                    if contract_expiry == target_expiry_str:
-                        option_conid = contract.get('conid')
-                        break
-                
-                if not option_conid and len(option_data) > 0:
-                    return None
-                    
-            elif isinstance(option_data, dict):
-                contract_expiry = option_data.get('maturityDate')
-                if contract_expiry == target_expiry_str:
-                    option_conid = option_data.get('conid')
-                else:
-                    return None
-            
-            if not option_conid:
-                return None
-            
-            # Get market data for the option
-            option_snapshot = self.client.get_market_data_snapshot(
-                option_conid,
-                fields=[
-                    '31',    # Last price
-                    '84',    # Bid
-                    '86',    # Ask
-                    '87',    # Volume
-                    '7308',  # Delta
-                    '7309',  # Gamma
-                    '7310',  # Vega
-                    '7311',  # Theta
-                    '7633',  # Implied Volatility % for this strike
-                ]
-            )
-            
-            if not option_snapshot:
-                logger.debug(f"No market data snapshot received")
-                return None
-            
-            logger.debug(f"Option data for ${strike:.0f}P: {option_snapshot}")
-            
-            # Parse option data
-            def to_float(val):
-                if val is None:
-                    return None
-                try:
-                    if isinstance(val, str):
-                        # Remove % sign, commas, and 'C' prefix
-                        val = val.replace('%', '').replace(',', '').lstrip('CH')
-                    return float(val)
-                except (ValueError, TypeError):
-                    return None
-            
-            # Get IV for this specific strike - field 7633 returns percentage like "19.9%"
-            strike_iv = to_float(option_snapshot.get('7633'))
-            if strike_iv and strike_iv > 5:
-                strike_iv = strike_iv / 100.0
-            
-            logger.debug(f"Parsed: Strike IV={strike_iv}, Stock IV/HV={stock_ivhv}, Delta={option_snapshot.get('7308')}")
-            
-            result = {
-                'strike': strike,
-                'bid': to_float(option_snapshot.get('84')),
-                'ask': to_float(option_snapshot.get('86')),
-                'last': to_float(option_snapshot.get('31')),
-                'delta': to_float(option_snapshot.get('7308')),
-                'gamma': to_float(option_snapshot.get('7309')),
-                'vega': to_float(option_snapshot.get('7310')),
-                'theta': to_float(option_snapshot.get('7311')),
-                'implied_vol': strike_iv,  # Use strike-specific IV
-                'volume': to_float(option_snapshot.get('87')),
-                'ivr': stock_ivhv  # Use calculated stock-level IV/HV ratio
-            }
-            
-            return result
-            
-        except Exception as e:
-            logger.warning(f"Error getting option data for strike {strike}: {e}")
             return None
     
     def _get_next_friday(self) -> date:
@@ -881,29 +814,30 @@ class PutScanner:
         
         Args:
             results: List of PutScanResult objects
-            top_n: Number of top results to print (default: 20)
+            top_n: Number of top results to display
         """
         if not results:
-            print("No results found.")
+            logger.info("No results to display")
             return
         
-        print("\n" + "=" * 120)
-        print(f"TOP {min(top_n, len(results))} HIGH IVR PUT SELLING OPPORTUNITIES")
-        print("=" * 120)
+        print("\n" + "=" * 140)
+        print(f"TOP {min(top_n, len(results))} PUT SELLING OPPORTUNITIES")
+        print("=" * 140)
         print(f"{'Symbol':<6} | {'Price':<8} | {'Strike':<8} | {'OTM%':<6} | "
-              f"{'DTE':<4} | {'IVR':<5} | {'IV':<7} | {'Delta':<7} | {'Mid':<8}")
-        print("-" * 120)
+              f"{'DTE':<4} | {'IVR':<5} | {'IV':<7} | {'Delta':<7} | {'Mid':<8} | {'Ann.Ret':<8}")
+        print("-" * 140)
         
-        for i, result in enumerate(results[:top_n]):
+        for result in results[:top_n]:
             ivr_str = f"{result.ivr:.1f}" if result.ivr is not None else "N/A"
             iv_str = f"{result.implied_vol:.1%}" if result.implied_vol is not None else "N/A"
-            delta_str = f"{abs(result.delta):.3f}" if result.delta is not None else "N/A"
+            delta_str = f"{result.delta:.3f}" if result.delta is not None else "N/A"
             mid_str = f"${result.mid:.2f}" if result.mid is not None else "N/A"
+            ann_ret_str = f"{result.annualized_return:.1f}%" if result.annualized_return is not None else "N/A"
             
-            print(f"{result.symbol:<6} | ${result.stock_price:>6.2f} | "
+            print(f"{result.symbol:<6} | ${result.current_price:>6.2f} | "
                   f"${result.strike:>6.2f} | {result.strike_pct_otm:>5.1f}% | "
                   f"{result.days_to_expiry:>3} | {ivr_str:>5} | {iv_str:>7} | "
-                  f"{delta_str:>7} | {mid_str:>8}")
+                  f"{delta_str:>7} | {mid_str:>8} | {ann_ret_str:>8}")
         
-        print("=" * 120)
+        print("=" * 140)
 

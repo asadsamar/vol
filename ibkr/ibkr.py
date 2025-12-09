@@ -5,6 +5,7 @@ import logging
 import configparser
 import os
 import time
+from datetime import date, datetime, timedelta
 from threading import Lock
 from collections import defaultdict
 
@@ -119,6 +120,69 @@ class IBWebAPIClient:
         # Initialize rate limiter with limits from config
         rate_limits = self._load_rate_limits()
         self.rate_limiter = RateLimiter(rate_limits)
+        
+        # Pre-flight setup: Call required endpoints and wait
+        logger.info("Performing pre-flight API setup...")
+        self._preflight_setup()
+    
+    def _preflight_setup(self):
+        """
+        Perform pre-flight setup by calling required endpoints.
+        This ensures the API is ready for market data requests.
+        
+        Per IBKR API docs:
+        - /iserver/accounts must be called before /iserver/marketdata/snapshot
+        - A small delay helps ensure data streams are ready
+        """
+        try:
+            # Step 1: Call /iserver/accounts (required before market data)
+            logger.info("Step 1: Fetching accounts...")
+            accounts = self._fetch_accounts()
+            
+            if accounts:
+                logger.info(f"  ✓ Found {len(accounts)} account(s)")
+                self.available_accounts = accounts
+                
+                # Auto-setup account
+                account_ids = [acc['accountId'] for acc in accounts]
+                configured_account = self.config.get('account', 'account_id', fallback='').strip()
+                
+                if configured_account and configured_account in account_ids:
+                    self.account_id = configured_account
+                    logger.info(f"  ✓ Using configured account: {configured_account}")
+                else:
+                    self.account_id = account_ids[0]
+                    logger.info(f"  ✓ Using first available account: {self.account_id}")
+            else:
+                logger.warning("  ✗ No accounts found, market data may not work")
+            
+            # Step 2: Make a test market data subscription (helps initialize data streams)
+            logger.info("Step 2: Initializing market data streams...")
+            # Use SPY as test symbol (always available)
+            test_contracts = self.search_contracts('SPY')
+            if test_contracts:
+                spy_conid = test_contracts[0].get('conid')
+                if spy_conid:
+                    # Make a test market data call (pre-flight request)
+                    test_snapshot = self.get_market_data_snapshot(spy_conid, fields=['31'])
+                    if test_snapshot:
+                        logger.info("  ✓ Market data streams initialized")
+                    else:
+                        logger.info("  ⚠ Market data pre-flight returned no data (this is normal)")
+                else:
+                    logger.info("  ⚠ Could not get SPY conid for test")
+            else:
+                logger.info("  ⚠ Could not find SPY for market data test")
+            
+            # Step 3: Wait for API to stabilize
+            logger.info("Step 3: Waiting 5 seconds for API to stabilize...")
+            time.sleep(5)
+            
+            logger.info("✓ Pre-flight setup complete, API ready for use")
+            
+        except Exception as e:
+            logger.error(f"Error during pre-flight setup: {e}")
+            logger.warning("Continuing anyway, but market data may not work immediately")
     
     def _load_rate_limits(self) -> Dict[str, float]:
         """
@@ -253,12 +317,19 @@ class IBWebAPIClient:
     def setup_account(self) -> bool:
         """
         Setup the account to use based on configuration.
-        Fetches available accounts and selects the configured one or the first available.
+        
+        Note: This is now mostly handled in _preflight_setup() during __init__.
+        This method is kept for backwards compatibility.
         
         Returns:
             True if account setup successful, False otherwise
         """
-        # Get available accounts
+        if self.account_id:
+            logger.info(f"Account already setup: {self.account_id}")
+            return True
+        
+        # If account wasn't set up during init, try again
+        logger.info("Account not set up, fetching accounts...")
         accounts_response = self._fetch_accounts()
         
         if not accounts_response:
@@ -539,7 +610,14 @@ class IBWebAPIClient:
         try:
             logger.info(f"Getting price for {symbol}...")
             
-            # Search for the contract
+            # Ensure account is set up
+            if not self.account_id:
+                logger.debug("Setting up account before market data request...")
+                if not self.setup_account():
+                    logger.warning("Failed to setup account")
+                    return None
+            
+            # Search for the contract (required pre-flight for market data)
             contracts = self.search_contracts(symbol)
             if not contracts:
                 logger.warning(f"No contracts found for {symbol}")
@@ -574,11 +652,34 @@ class IBWebAPIClient:
             
             logger.info(f"Getting market data for {symbol} (conid: {conid}, exchange: {exchange})")
             
-            # Get market data
-            snapshot = self.get_market_data_snapshot(conid, fields=['31', '84', '86', '87'])
+            # Small delay after contract search (helps with pre-flight)
+            time.sleep(0.5)
+            
+            # Get market data - may need retry for pre-flight
+            snapshot = None
+            for attempt in range(3):
+                snapshot = self.get_market_data_snapshot(
+                    conid, 
+                    fields=['31', '84', '86', '87'],
+                    ensure_preflight=False  # Already ensured above
+                )
+                
+                if snapshot:
+                    # Check if we have actual price data (not just metadata)
+                    metadata_keys = {'conid', 'conidEx', '_updated', 'server_id', '6119', '6509'}
+                    has_price_data = any(key not in metadata_keys for key in snapshot.keys())
+                    
+                    if has_price_data:
+                        break
+                    else:
+                        logger.debug(f"Pre-flight response, retrying... (attempt {attempt + 1}/3)")
+                        time.sleep(1.0)
+                else:
+                    logger.debug(f"No snapshot, retrying... (attempt {attempt + 1}/3)")
+                    time.sleep(1.0)
             
             if not snapshot:
-                logger.warning(f"No market data snapshot for {symbol}")
+                logger.warning(f"No market data snapshot for {symbol} after retries")
                 return None
             
             # Try to extract price from various fields
@@ -647,18 +748,32 @@ class IBWebAPIClient:
     def get_market_data_snapshot(
         self,
         conid: int,
-        fields: Optional[List[str]] = None
+        fields: Optional[List[str]] = None,
+        ensure_preflight: bool = True
     ) -> Optional[Dict]:
         """
         Get market data snapshot for a contract.
         
+        Note: Per IBKR API requirements:
+        - /iserver/accounts must be called prior to /iserver/marketdata/snapshot
+        - For derivative contracts, /iserver/secdef/search must be called first
+        - These are per-contract requirements
+        
         Args:
             conid: Contract ID
             fields: List of field IDs to request (e.g., ['84', '86'] for bid/ask)
+            ensure_preflight: If True, ensure account is setup before request
             
         Returns:
             Dictionary of field values, or None if failed
         """
+        # Ensure accounts have been fetched (pre-flight requirement)
+        if ensure_preflight and not self.account_id:
+            logger.debug("Account not set up, fetching accounts first...")
+            if not self.setup_account():
+                logger.warning("Failed to setup account before market data request")
+                return None
+        
         url = f"{self.base_url}/iserver/marketdata/snapshot"
         
         # Build fields parameter
@@ -686,8 +801,199 @@ class IBWebAPIClient:
                 logger.debug(f"No data in market snapshot response")
                 return None
             
-            return data[0]
+            snapshot = data[0]
+            
+            # Check if this is just a pre-flight response (only metadata)
+            metadata_keys = {'conid', 'conidEx', '_updated', 'server_id', '6119', '6509'}
+            has_data = any(key not in metadata_keys for key in snapshot.keys())
+            
+            if not has_data:
+                logger.debug(f"Received pre-flight response for conid {conid}, data may populate on next call")
+            
+            return snapshot
                 
         except Exception as e:
             logger.error(f"Error getting market data: {e}")
+            return None
+    
+    def get_option_data(
+        self,
+        stock_conid: int,
+        strike: float,
+        expiry_date: date,
+        right: str = 'P',
+        exchange: str = 'SMART'
+    ) -> Optional[Dict]:
+        """
+        Get option market data for a specific strike and expiry.
+        
+        This method handles all IBKR-specific pre-flight requirements:
+        1. Calls /iserver/secdef/info to get option contract
+        2. Calls /iserver/secdef/search for market data subscription (pre-flight)
+        3. Waits for subscription to initialize
+        4. Fetches market data snapshot with retry logic
+        
+        Args:
+            stock_conid: Stock contract ID
+            strike: Strike price
+            expiry_date: Expiration date
+            right: 'P' for put, 'C' for call (default: 'P')
+            exchange: Exchange (default: 'SMART')
+            
+        Returns:
+            Dictionary with option data:
+            {
+                'strike': float,
+                'bid': float,
+                'ask': float,
+                'last': float,
+                'delta': float,
+                'gamma': float,
+                'vega': float,
+                'theta': float,
+                'implied_vol': float,
+                'volume': float
+            }
+        """
+        try:
+            # Step 1: Get the specific option contract
+            month_format = expiry_date.strftime('%Y%m')
+            option_params = {
+                'conid': stock_conid,
+                'sectype': 'OPT',
+                'month': month_format,
+                'exchange': exchange,
+                'strike': str(strike),
+                'right': right
+            }
+            
+            secdef_url = f"{self.base_url}/iserver/secdef/info"
+            secdef_response = self._make_request('GET', secdef_url, params=option_params)
+            
+            if secdef_response.status_code != 200:
+                logger.debug(f"Failed to get option contract: status {secdef_response.status_code}")
+                return None
+            
+            option_data = secdef_response.json()
+            
+            # Find contract with matching expiry
+            option_conid = None
+            target_expiry_str = expiry_date.strftime('%Y%m%d')
+            
+            if isinstance(option_data, list):
+                for contract in option_data:
+                    contract_expiry = contract.get('maturityDate')
+                    if contract_expiry == target_expiry_str:
+                        option_conid = contract.get('conid')
+                        break
+                
+                if not option_conid and len(option_data) > 0:
+                    return None
+                    
+            elif isinstance(option_data, dict):
+                contract_expiry = option_data.get('maturityDate')
+                if contract_expiry == target_expiry_str:
+                    option_conid = option_data.get('conid')
+                else:
+                    return None
+            
+            if not option_conid:
+                return None
+            
+            logger.debug(f"Found option conid {option_conid} for ${strike:.0f}{right}, calling secdef for pre-flight...")
+            
+            # Step 2: Call secdef/search for this specific option (required pre-flight for derivatives)
+            # This subscribes to market data for this contract
+            secdef_search_url = f"{self.base_url}/iserver/secdef/search"
+            search_params = {'symbol': str(option_conid)}
+            search_response = self._make_request('GET', secdef_search_url, params=search_params)
+            
+            if search_response.status_code == 200:
+                logger.debug(f"Pre-flight secdef/search complete for option conid {option_conid}")
+            else:
+                logger.debug(f"Pre-flight secdef/search failed for option conid {option_conid}: {search_response.status_code}")
+            
+            # Small delay to allow subscription to initialize
+            time.sleep(0.3)
+            
+            # Step 3: Get market data for the option (should now have data subscribed)
+            option_snapshot = self.get_market_data_snapshot(
+                option_conid,
+                fields=[
+                    '31',    # Last price
+                    '84',    # Bid
+                    '86',    # Ask
+                    '87',    # Volume
+                    '7308',  # Delta
+                    '7309',  # Gamma
+                    '7310',  # Vega
+                    '7311',  # Theta
+                    '7633',  # Implied Volatility % for this strike
+                ],
+                ensure_preflight=False  # We already did pre-flight
+            )
+            
+            if not option_snapshot:
+                logger.debug(f"No market data snapshot received for ${strike:.0f}{right}")
+                return None
+            
+            # Check if we got actual data or just metadata
+            metadata_keys = {'conid', 'conidEx', '_updated', 'server_id', '6119', '6509'}
+            has_data = any(key not in metadata_keys for key in option_snapshot.keys())
+            
+            if not has_data:
+                logger.debug(f"Only metadata received for ${strike:.0f}{right}, retrying once...")
+                time.sleep(1.0)
+                option_snapshot = self.get_market_data_snapshot(
+                    option_conid,
+                    fields=['31', '84', '86', '87', '7308', '7309', '7310', '7311', '7633'],
+                    ensure_preflight=False
+                )
+                
+                if not option_snapshot:
+                    return None
+                
+                has_data = any(key not in metadata_keys for key in option_snapshot.keys())
+                if not has_data:
+                    logger.debug(f"Still no data for ${strike:.0f}{right} after retry")
+                    return None
+            
+            logger.debug(f"Option data for ${strike:.0f}{right}: {option_snapshot}")
+            
+            # Parse option data
+            def to_float(val):
+                if val is None:
+                    return None
+                try:
+                    if isinstance(val, str):
+                        # Remove % sign, commas, and 'C' prefix
+                        val = val.replace('%', '').replace(',', '').lstrip('CH')
+                    return float(val)
+                except (ValueError, TypeError):
+                    return None
+            
+            # Get IV for this specific strike - field 7633 returns percentage like "19.9%"
+            strike_iv = to_float(option_snapshot.get('7633'))
+            if strike_iv and strike_iv > 5:
+                strike_iv = strike_iv / 100.0
+            
+            logger.debug(f"Parsed: Strike IV={strike_iv}, Delta={option_snapshot.get('7308')}")
+            
+            result = {
+                'strike': strike,
+                'bid': to_float(option_snapshot.get('84')),
+                'ask': to_float(option_snapshot.get('86')),
+                'last': to_float(option_snapshot.get('31')),
+                'delta': to_float(option_snapshot.get('7308')),
+                'gamma': to_float(option_snapshot.get('7309')),
+                'vega': to_float(option_snapshot.get('7310')),
+                'theta': to_float(option_snapshot.get('7311')),
+                'implied_vol': strike_iv,
+                'volume': to_float(option_snapshot.get('87'))
+            }
+            
+            return result
+            
+        except Exception as e:
+            logger.warning(f"Error getting option data for strike {strike}: {e}")
             return None
