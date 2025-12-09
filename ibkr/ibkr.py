@@ -1,6 +1,6 @@
 import requests
 import json
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any, Union
 import logging
 import configparser
 import os
@@ -664,7 +664,22 @@ class IBWebAPIClient:
                     ensure_preflight=False  # Already ensured above
                 )
                 
+                logger.debug(f"Attempt {attempt + 1}: snapshot type = {type(snapshot)}, value = {snapshot}")
+                
                 if snapshot:
+                    # Check the type - if it's a list, something went wrong
+                    if isinstance(snapshot, list):
+                        logger.error(f"ERROR: get_market_data_snapshot returned a list when single conid was passed!")
+                        logger.error(f"  conid passed: {conid} (type: {type(conid)})")
+                        logger.error(f"  snapshot received: {snapshot}")
+                        # Take first element if it's a list
+                        if len(snapshot) > 0:
+                            snapshot = snapshot[0]
+                        else:
+                            snapshot = None
+                            time.sleep(1.0)
+                            continue
+                    
                     # Check if we have actual price data (not just metadata)
                     metadata_keys = {'conid', 'conidEx', '_updated', 'server_id', '6119', '6509'}
                     has_price_data = any(key not in metadata_keys for key in snapshot.keys())
@@ -747,12 +762,12 @@ class IBWebAPIClient:
     
     def get_market_data_snapshot(
         self,
-        conid: int,
+        conid: Union[int, List[int]],
         fields: Optional[List[str]] = None,
         ensure_preflight: bool = True
-    ) -> Optional[Dict]:
+    ) -> Optional[Union[Dict, List[Dict]]]:
         """
-        Get market data snapshot for a contract.
+        Get market data snapshot for one or more contracts.
         
         Note: Per IBKR API requirements:
         - /iserver/accounts must be called prior to /iserver/marketdata/snapshot
@@ -760,12 +775,13 @@ class IBWebAPIClient:
         - These are per-contract requirements
         
         Args:
-            conid: Contract ID
+            conid: Contract ID or list of contract IDs
             fields: List of field IDs to request (e.g., ['84', '86'] for bid/ask)
             ensure_preflight: If True, ensure account is setup before request
             
         Returns:
-            Dictionary of field values, or None if failed
+            Dictionary of field values (single conid) or list of dicts (multiple conids)
+            None if failed
         """
         # Ensure accounts have been fetched (pre-flight requirement)
         if ensure_preflight and not self.account_id:
@@ -776,6 +792,15 @@ class IBWebAPIClient:
         
         url = f"{self.base_url}/iserver/marketdata/snapshot"
         
+        # Handle single conid or list - convert string to int if needed
+        if isinstance(conid, str):
+            conid = int(conid)
+        
+        is_single = isinstance(conid, int)
+        conids = [conid] if is_single else list(conid)
+        
+        logger.debug(f"get_market_data_snapshot called with conid={conid} (type={type(conid)}), is_single={is_single}")
+        
         # Build fields parameter
         if fields:
             fields_str = ','.join(str(f) for f in fields)
@@ -784,9 +809,11 @@ class IBWebAPIClient:
             fields_str = '31,84,86,87'  # Last, Bid, Ask, Volume
         
         params = {
-            'conids': str(conid),
+            'conids': ','.join(str(c) for c in conids),
             'fields': fields_str
         }
+        
+        logger.debug(f"Request params: {params}")
         
         try:
             response = self._make_request('GET', url, params=params)
@@ -801,16 +828,22 @@ class IBWebAPIClient:
                 logger.debug(f"No data in market snapshot response")
                 return None
             
-            snapshot = data[0]
-            
             # Check if this is just a pre-flight response (only metadata)
             metadata_keys = {'conid', 'conidEx', '_updated', 'server_id', '6119', '6509'}
-            has_data = any(key not in metadata_keys for key in snapshot.keys())
             
-            if not has_data:
-                logger.debug(f"Received pre-flight response for conid {conid}, data may populate on next call")
+            for snapshot in data:
+                has_data = any(key not in metadata_keys for key in snapshot.keys())
+                if not has_data:
+                    logger.debug(f"Received pre-flight response for conid {snapshot.get('conid')}, data may populate on next call")
             
-            return snapshot
+            # Return single dict if single conid was requested, otherwise return list
+            logger.debug(f"Returning: is_single={is_single}, data type={type(data)}, len={len(data)}")
+            if is_single:
+                logger.debug(f"Returning single dict: {type(data[0])}")
+                return data[0]
+            else:
+                logger.debug(f"Returning list of dicts")
+                return data
                 
         except Exception as e:
             logger.error(f"Error getting market data: {e}")
@@ -878,7 +911,7 @@ class IBWebAPIClient:
             
             # Find contract with matching expiry
             option_conid = None
-            target_expiry_str = expiry_date.strftime('%Y%m%d')
+            target_expiry_str = expiry_date.strftime('%Y%m%d');
             
             if isinstance(option_data, list):
                 for contract in option_data:
@@ -997,3 +1030,572 @@ class IBWebAPIClient:
         except Exception as e:
             logger.warning(f"Error getting option data for strike {strike}: {e}")
             return None
+    
+    def get_option_chain(
+        self,
+        stock_conid: int,
+        expiry_date: date,
+        right: str = 'P',
+        exchange: str = 'SMART'
+    ) -> Optional[List[Dict]]:
+        """
+        Get all available option strikes for a given expiry.
+        
+        Uses /iserver/secdef/info to efficiently retrieve all strikes.
+        
+        Args:
+            stock_conid: Stock contract ID
+            expiry_date: Expiration date
+            right: 'P' for put, 'C' for call
+            exchange: Exchange (default: 'SMART')
+            
+        Returns:
+            List of option contract dicts with keys:
+            - conid: Option contract ID
+            - strike: Strike price
+            - maturityDate: Expiry in YYYYMMDD format
+            - right: 'P' or 'C'
+        """
+        try:
+            month_format = expiry_date.strftime('%Y%m')
+            
+            params = {
+                'conid': stock_conid,
+                'sectype': 'OPT',
+                'month': month_format,
+                'exchange': exchange,
+                'right': right
+            }
+            
+            url = f"{self.base_url}/iserver/secdef/info"
+            response = self._make_request('GET', url, params=params)
+            
+            if response.status_code != 200:
+                logger.warning(f"Failed to get option chain: status {response.status_code}")
+                return None
+            
+            data = response.json()
+            
+            if not data:
+                logger.debug("No option chain data returned")
+                return None
+            
+            # Filter to exact expiry date
+            target_expiry_str = expiry_date.strftime('%Y%m%d')
+            
+            if isinstance(data, list):
+                matching_options = [
+                    opt for opt in data 
+                    if opt.get('maturityDate') == target_expiry_str
+                ]
+            elif isinstance(data, dict):
+                if data.get('maturityDate') == target_expiry_str:
+                    matching_options = [data]
+                else:
+                    matching_options = []
+            else:
+                matching_options = []
+            
+            logger.info(f"Found {len(matching_options)} {right} options for {expiry_date.strftime('%Y-%m-%d')}")
+            return matching_options
+            
+        except Exception as e:
+            logger.error(f"Error getting option chain: {e}")
+            return None
+    
+    def get_option_strikes(
+        self,
+        stock_conid: int,
+        expiry_date: date,
+        sectype: str = 'OPT'
+    ) -> Optional[Dict]:
+        """
+        Get available option strikes for a contract using the proper 3-step procedure.
+        
+        Step 1: Call /iserver/secdef/search for underlying (always required)
+        Step 2: Call /iserver/secdef/strikes with month
+        
+        Args:
+            stock_conid: Stock contract ID
+            expiry_date: Expiration date to get strikes for
+            sectype: Security type (default: 'OPT')
+            
+        Returns:
+            Dict with available strikes by type:
+            {
+                'call': [strike1, strike2, ...],
+                'put': [strike1, strike2, ...],
+                etc.
+            }
+        """
+        try:
+            month_format = expiry_date.strftime('%Y%m')
+            
+            # Step 1: Search for underlying symbol (always required before building option chain)
+            logger.debug(f"Step 1: Searching for underlying conid {stock_conid}")
+            search_url = f"{self.base_url}/iserver/secdef/search"
+            search_params = {'symbol': str(stock_conid)}
+            
+            search_response = self._make_request('GET', search_url, params=search_params)
+            
+            if search_response.status_code != 200:
+                logger.warning(f"Step 1 failed: status {search_response.status_code}")
+                return None
+            
+            logger.debug(f"Step 1 complete: searched underlying")
+            
+            # Small delay between steps
+            time.sleep(0.2)
+            
+            # Step 2: Get strikes using conid and month
+            logger.debug(f"Step 2: Getting strikes for conid {stock_conid}, month {month_format}")
+            strikes_url = f"{self.base_url}/iserver/secdef/strikes"
+            strikes_params = {
+                'conid': stock_conid,
+                'sectype': sectype,
+                'month': month_format
+            }
+            
+            strikes_response = self._make_request('GET', strikes_url, params=strikes_params)
+            
+            if strikes_response.status_code != 200:
+                logger.warning(f"Step 2 failed: status {strikes_response.status_code}")
+                return None
+            
+            strikes_data = strikes_response.json()
+            logger.debug(f"Step 2 complete: Retrieved strikes data")
+            
+            if isinstance(strikes_data, dict):
+                if 'call' in strikes_data:
+                    call_count = len(strikes_data['call']) if isinstance(strikes_data['call'], list) else 0
+                    logger.info(f"Found {call_count} call strikes")
+                if 'put' in strikes_data:
+                    put_count = len(strikes_data['put']) if isinstance(strikes_data['put'], list) else 0
+                    logger.info(f"Found {put_count} put strikes")
+            
+            return strikes_data
+            
+        except Exception as e:
+            logger.error(f"Error getting strikes: {e}", exc_info=True)
+            return None
+    
+    def get_options_near_strike(
+        self,
+        stock_conid: int,
+        target_strike: float,
+        expiry_date: date,
+        right: str = 'P',
+        num_strikes: int = 10,
+        exchange: str = 'SMART'
+    ) -> List[Dict]:
+        """
+        Get option strikes near a target strike price using proper option chain procedure.
+        
+        Args:
+            stock_conid: Stock contract ID
+            target_strike: Target strike price
+            expiry_date: Expiration date
+            right: 'P' for put, 'C' for call
+            num_strikes: Number of strikes to return (centered around target)
+            exchange: Exchange (default: 'SMART')
+            
+        Returns:
+            List of dicts with 'strike' and 'distance' keys, sorted by distance
+        """
+        try:
+            # Use the proper 3-step procedure to get strikes
+            strikes_data = self.get_option_strikes(stock_conid, expiry_date)
+            
+            if not strikes_data:
+                logger.debug("No strikes data returned")
+                return []
+            
+            # Extract strikes for the requested right (P/C)
+            strikes = []
+            
+            if right == 'P' and 'put' in strikes_data:
+                strikes = strikes_data.get('put', [])
+            elif right == 'C' and 'call' in strikes_data:
+                strikes = strikes_data.get('call', [])
+            elif 'strike' in strikes_data:
+                # Some responses might have a generic 'strike' array
+                strikes = strikes_data.get('strike', [])
+            
+            # Convert to floats
+            float_strikes = []
+            for s in strikes:
+                try:
+                    float_strikes.append(float(s))
+                except (ValueError, TypeError):
+                    continue
+            
+            if not float_strikes:
+                logger.debug(f"No {right} strikes found in response")
+                return []
+            
+            logger.info(f"Found {len(float_strikes)} available {right} strikes")
+            
+            # Calculate distance from target and sort
+            strikes_with_distance = [
+                {
+                    'strike': strike,
+                    'distance': abs(strike - target_strike)
+                }
+                for strike in float_strikes
+            ]
+            
+            strikes_with_distance.sort(key=lambda x: x['distance'])
+            
+            # Return top N closest strikes
+            result = strikes_with_distance[:num_strikes]
+            
+            if result:
+                logger.info(f"Returning {len(result)} strikes closest to ${target_strike:.2f}")
+                closest_strikes_str = ', '.join([f"${s['strike']:.2f}" for s in result[:5]])
+                logger.debug(f"  Closest strikes: {closest_strikes_str}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting options near strike: {e}", exc_info=True)
+            return []
+    
+    def get_options_data_batch(
+        self,
+        options_specs: List[Dict],
+        right: str = 'P',
+        exchange: str = 'SMART',
+        skip_preflight: bool = False
+    ) -> List[Optional[Dict]]:
+        """
+        Get option market data for multiple options in batch.
+        Much faster than calling get_option_data() individually.
+        
+        Uses the proper option chain building procedure:
+        Step 1: Search underlying + Get strikes (pre-flight) - optional if already done
+        Step 2: Get all option conids for the strikes we want
+        Step 3: Get market data for ALL options in ONE batch call
+        
+        Args:
+            options_specs: List of dicts with keys:
+                - stock_conid: Stock contract ID
+                - strike: Strike price
+                - expiry_date: Expiration date
+            right: 'P' for put, 'C' for call (default: 'P')
+            exchange: Exchange (default: 'SMART')
+            skip_preflight: If True, skip the search+strikes pre-flight (already done)
+            
+        Returns:
+            List of option data dicts (same order as input), None for failed requests
+        """
+        if not options_specs:
+            return []
+        
+        logger.info(f"Batch requesting {len(options_specs)} option contracts...")
+        
+        # Only do pre-flight if not already done
+        if not skip_preflight:
+            # Group by stock_conid and expiry for efficient querying
+            specs_by_underlying = {}
+            for i, spec in enumerate(options_specs):
+                key = (spec['stock_conid'], spec['expiry_date'].strftime('%Y%m'))
+                if key not in specs_by_underlying:
+                    specs_by_underlying[key] = []
+                specs_by_underlying[key].append((i, spec))
+            
+            logger.info(f"Grouped into {len(specs_by_underlying)} underlying/expiry combinations")
+            
+            # Step 1: For each underlying/expiry, do pre-flight (search + get strikes)
+            # This is required once per underlying/expiry combination
+            for (stock_conid, month), specs in specs_by_underlying.items():
+                logger.debug(f"Pre-flight for conid {stock_conid}, month {month}")
+                expiry_date = specs[0][1]['expiry_date']
+                # This does the 2-step pre-flight: search underlying + get strikes
+                strikes_data = self.get_option_strikes(stock_conid, expiry_date)
+                if strikes_data:
+                    logger.debug(f"  Pre-flight complete for {stock_conid}")
+            
+            # Small delay after pre-flights
+            time.sleep(0.3)
+        else:
+            logger.debug("Skipping pre-flight (already done)")
+        
+        # Step 2: Get option conids for ALL strikes we're interested in
+        option_conids = []
+        option_map = {}  # Map conid to original index
+        
+        logger.info("Step 2: Getting option conids for all strikes...")
+        for i, spec in enumerate(options_specs):
+            try:
+                stock_conid = spec['stock_conid']
+                strike = spec['strike']
+                expiry_date = spec['expiry_date']
+                month_format = expiry_date.strftime('%Y%m')
+                
+                # Get specific option contract conid
+                option_params = {
+                    'conid': stock_conid,
+                    'sectype': 'OPT',
+                    'month': month_format,
+                    'exchange': exchange,
+                    'strike': str(strike),
+                    'right': right
+                }
+                
+                secdef_url = f"{self.base_url}/iserver/secdef/info"
+                secdef_response = self._make_request('GET', secdef_url, params=option_params)
+                
+                if secdef_response.status_code != 200:
+                    logger.debug(f"Failed to get option contract #{i} (strike ${strike}): status {secdef_response.status_code}")
+                    option_conids.append(None)
+                    continue
+                
+                option_data = secdef_response.json()
+                target_expiry_str = expiry_date.strftime('%Y%m%d');
+                
+                option_conid = None
+                if isinstance(option_data, list):
+                    for contract in option_data:
+                        if contract.get('maturityDate') == target_expiry_str:
+                            option_conid = contract.get('conid')
+                            break
+                elif isinstance(option_data, dict):
+                    if option_data.get('maturityDate') == target_expiry_str:
+                        option_conid = option_data.get('conid')
+                
+                if option_conid:
+                    option_conids.append(option_conid)
+                    option_map[option_conid] = i
+                    logger.debug(f"  Strike ${strike}: conid {option_conid}")
+                else:
+                    option_conids.append(None)
+                    logger.debug(f"  Strike ${strike}: not found")
+                    
+            except Exception as e:
+                logger.warning(f"Error getting option contract #{i}: {e}")
+                option_conids.append(None)
+        
+        valid_conids = [c for c in option_conids if c is not None]
+        logger.info(f"Found {len(valid_conids)}/{len(options_specs)} valid option contracts")
+        
+        if not valid_conids:
+            return [None] * len(options_specs)
+        
+        # Step 3: Get market data for ALL options in ONE batch call
+        logger.info(f"Step 3: Requesting market data for ALL {len(valid_conids)} options in ONE batch call...")
+        logger.debug(f"Batch conids: {valid_conids}")
+        
+        # Small delay to allow data to populate
+        time.sleep(0.5)
+        
+        snapshots = self.get_market_data_snapshot(
+            valid_conids,  # Pass list of all conids
+            fields=['31', '84', '86', '87', '7308', '7309', '7310', '7311', '7633'],
+            ensure_preflight=False
+        )
+        
+        if not snapshots:
+            logger.warning("No market data returned from batch request")
+            return [None] * len(options_specs)
+        
+        logger.info(f"Received {len(snapshots)} snapshots from batch request")
+        
+        # Parse and map results back to original order
+        results = [None] * len(options_specs)
+        
+        for snapshot in snapshots:
+            conid = snapshot.get('conid')
+            if conid not in option_map:
+                continue
+            
+            original_idx = option_map[conid]
+            spec = options_specs[original_idx]
+            
+            # Parse option data
+            def to_float(val):
+                if val is None:
+                    return None
+                try:
+                    if isinstance(val, str):
+                        val = val.replace('%', '').replace(',', '').lstrip('CH')
+                    return float(val)
+                except (ValueError, TypeError):
+                    return None
+            
+            strike_iv = to_float(snapshot.get('7633'))
+            if strike_iv and strike_iv > 5:
+                strike_iv = strike_iv / 100.0
+            
+            results[original_idx] = {
+                'strike': spec['strike'],
+                'bid': to_float(snapshot.get('84')),
+                'ask': to_float(snapshot.get('86')),
+                'last': to_float(snapshot.get('31')),
+                'delta': to_float(snapshot.get('7308')),
+                'gamma': to_float(snapshot.get('7309')),
+                'vega': to_float(snapshot.get('7310')),
+                'theta': to_float(snapshot.get('7311')),
+                'implied_vol': strike_iv,
+                'volume': to_float(snapshot.get('87'))
+            }
+        
+        success_count = sum(1 for r in results if r is not None)
+        logger.info(f"Successfully parsed {success_count}/{len(options_specs)} results")
+        
+        return results
+    
+    def get_stock_prices_batch(
+        self,
+        symbols: List[str],
+        exchange: str = 'SMART'
+    ) -> Dict[str, Optional[float]]:
+        """
+        Get current stock prices for multiple symbols in batch.
+        Much faster than calling get_stock_price() individually.
+        
+        Args:
+            symbols: List of stock ticker symbols
+            exchange: Exchange (default: SMART for best execution)
+            
+        Returns:
+            Dictionary mapping symbol to price (None if failed)
+        """
+        if not symbols:
+            return {}
+        
+        logger.info(f"Batch requesting prices for {len(symbols)} symbols...")
+        
+        # Ensure account is set up
+        if not self.account_id:
+            logger.debug("Setting up account before batch market data request...")
+            if not self.setup_account():
+                logger.warning("Failed to setup account")
+                return {symbol: None for symbol in symbols}
+        
+        # Step 1: Search for all contracts
+        symbol_to_conid = {}
+        conid_to_symbol = {}
+        
+        for symbol in symbols:
+            try:
+                contracts = self.search_contracts(symbol)
+                if not contracts:
+                    logger.debug(f"No contracts found for {symbol}")
+                    symbol_to_conid[symbol] = None
+                    continue
+                
+                # Find the primary stock contract
+                stock_contract = None
+                for contract in contracts:
+                    sections = contract.get('sections', [])
+                    has_stock = any(section.get('secType') == 'STK' for section in sections)
+                    
+                    if has_stock and contract.get('symbol') == symbol:
+                        description = contract.get('description', '')
+                        # Prefer NYSE or NASDAQ
+                        if 'NYSE' in description or 'NASDAQ' in description:
+                            stock_contract = contract
+                            break
+                        elif not stock_contract:
+                            stock_contract = contract
+            
+                if stock_contract:
+                    conid = int(stock_contract.get('conid'))
+                    symbol_to_conid[symbol] = conid
+                    conid_to_symbol[conid] = symbol
+                    logger.debug(f"Found conid {conid} for {symbol}")
+                else:
+                    symbol_to_conid[symbol] = None
+                    
+            except Exception as e:
+                logger.warning(f"Error searching for {symbol}: {e}")
+                symbol_to_conid[symbol] = None
+        
+        valid_conids = [conid for conid in symbol_to_conid.values() if conid is not None]
+        logger.info(f"Found {len(valid_conids)}/{len(symbols)} valid stock contracts")
+        
+        if not valid_conids:
+            return {symbol: None for symbol in symbols}
+        
+        # Small delay after contract searches
+        time.sleep(0.5)
+        
+        # Step 2: Batch request market data for all stocks
+        logger.info(f"Requesting market data for {len(valid_conids)} stocks in batch...")
+        
+        # Try with retry logic
+        snapshots = None
+        for attempt in range(3):
+            snapshots = self.get_market_data_snapshot(
+                valid_conids,
+                fields=['31', '84', '86', '87'],
+                ensure_preflight=False  # Already ensured above
+            )
+            
+            if snapshots:
+                # Check if we have actual price data (not just metadata)
+                metadata_keys = {'conid', 'conidEx', '_updated', 'server_id', '6119', '6509'}
+                has_data_count = sum(
+                    1 for snapshot in snapshots 
+                    if any(key not in metadata_keys for key in snapshot.keys())
+                )
+                
+                if has_data_count > 0:
+                    logger.debug(f"Got data for {has_data_count}/{len(snapshots)} stocks on attempt {attempt + 1}")
+                    break
+                else:
+                    logger.debug(f"Pre-flight response, retrying... (attempt {attempt + 1}/3)")
+                    time.sleep(1.0)
+            else:
+                logger.debug(f"No snapshots, retrying... (attempt {attempt + 1}/3)")
+                time.sleep(1.0)
+        
+        if not snapshots:
+            logger.warning("No market data returned from batch request")
+            return {symbol: None for symbol in symbols}
+        
+        # Step 3: Parse results and map back to symbols
+        results = {}
+        
+        def to_float(val):
+            if val is None:
+                return None
+            try:
+                if isinstance(val, str):
+                    val = val.lstrip('CH').replace(',', '')
+                return float(val)
+            except (ValueError, TypeError):
+                return None
+        
+        for snapshot in snapshots:
+            conid = snapshot.get('conid')
+            if conid not in conid_to_symbol:
+                continue
+            
+            symbol = conid_to_symbol[conid]
+            
+            # Try to extract price from various fields
+            # Priority: last price (31) > bid (84)
+            last_price = snapshot.get('31')
+            bid = snapshot.get('84')
+            
+            price = to_float(last_price)
+            if price is None:
+                price = to_float(bid)
+            
+            results[symbol] = price
+            
+            if price:
+                logger.debug(f"{symbol}: ${price:.2f}")
+            else:
+                logger.debug(f"{symbol}: No price data in snapshot")
+        
+        # Fill in None for symbols that weren't found
+        for symbol in symbols:
+            if symbol not in results:
+                results[symbol] = None
+        
+        success_count = sum(1 for price in results.values() if price is not None)
+        logger.info(f"Successfully got prices for {success_count}/{len(symbols)} symbols")
+        
+        return results

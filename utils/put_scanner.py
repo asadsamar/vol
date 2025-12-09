@@ -6,6 +6,7 @@ from datetime import datetime, date, timedelta
 import logging
 from dataclasses import dataclass
 import time
+import configparser
 
 logger = logging.getLogger(__name__)
 
@@ -94,18 +95,18 @@ class PutScanResult:
 
 
 class PutScanner:
-    """
-    Scanner for finding high IVR put selling opportunities across indices.
-    """
+    """Scanner for finding put selling opportunities."""
     
-    def __init__(self, ibkr_client):
+    def __init__(self, client: 'IBWebAPIClient', config: Optional[configparser.ConfigParser] = None):
         """
         Initialize the put scanner.
         
         Args:
-            ibkr_client: IBWebAPIClient instance for market data
+            client: IBWebAPIClient instance
+            config: Optional configuration (for num_strikes setting)
         """
-        self.client = ibkr_client
+        self.client = client
+        self.config = config
         
         # Cache for index constituents
         self._symbol_cache = {}
@@ -256,11 +257,79 @@ class PutScanner:
             PutScanResult object or None
         """
         try:
-            # Get current stock price
-            stock_price = self._get_stock_price(symbol)
+            # Get stock contract ID and all market data in one go
+            contracts = self.client.search_contracts(symbol)
+            if not contracts:
+                logger.info(f"  ✗ {symbol}: Could not find contracts")
+                return None
+            
+            stock_conid = None
+            for contract in contracts:
+                if contract.get('symbol') == symbol:
+                    sections = contract.get('sections', [])
+                    if any(s.get('secType') == 'STK' for s in sections):
+                        stock_conid = int(contract.get('conid'))
+                        break
+            
+            if not stock_conid:
+                logger.info(f"  ✗ {symbol}: No stock contract found")
+                return None
+            
+            # Get ALL data we need in ONE snapshot call: price (31), IV (7283), HV (7088)
+            snapshots = self.client.get_market_data_snapshot(
+                [stock_conid],
+                fields=['31', '84', '86', '7283', '7088'],  # last, bid, ask, IV, HV
+                ensure_preflight=False
+            )
+            
+            if not snapshots or len(snapshots) == 0:
+                logger.info(f"  ✗ {symbol}: No market data available")
+                return None
+            
+            snapshot = snapshots[0]
+            
+            # Extract stock price
+            stock_price = None
+            last_price = snapshot.get('31')
+            bid = snapshot.get('84')
+            
+            def to_float(val):
+                if val is None:
+                    return None
+                try:
+                    if isinstance(val, str):
+                        val = val.lstrip('CH').replace(',', '')
+                    return float(val)
+                except (ValueError, TypeError):
+                    return None
+            
+            stock_price = to_float(last_price)
+            if stock_price is None:
+                stock_price = to_float(bid)
+            
             if not stock_price:
                 logger.info(f"  ✗ {symbol}: Could not get stock price")
                 return None
+            
+            # Extract and calculate IV/HV ratio
+            iv_str = snapshot.get('7283')
+            hv_str = snapshot.get('7088')
+            
+            stock_ivhv = None
+            if iv_str and hv_str:
+                def parse_pct(val):
+                    if isinstance(val, (int, float)):
+                        return float(val)
+                    if isinstance(val, str):
+                        return float(val.replace('%', '').strip())
+                    return None
+                
+                iv = parse_pct(iv_str)
+                hv = parse_pct(hv_str)
+                
+                if iv is not None and hv is not None and hv != 0:
+                    stock_ivhv = (iv / hv) * 100
+                    logger.debug(f"{symbol} IV/HV: {stock_ivhv:.1f}% (IV={iv:.1f}% / HV={hv:.1f}%)")
             
             # Calculate target strike
             target_strike = stock_price * (1 - strike_pct_below / 100)
@@ -269,8 +338,16 @@ class PutScanner:
             if expiry_date is None:
                 expiry_date = self._get_next_friday()
             
-            # Find put option
-            option_data = self._find_put_option(symbol, stock_price, target_strike, expiry_date, target_delta)
+            # Find put option (pass conid to avoid duplicate search)
+            option_data = self._find_put_option_with_conid(
+                symbol=symbol,
+                stock_conid=stock_conid,
+                stock_price=stock_price,
+                target_strike=target_strike,
+                expiry_date=expiry_date,
+                target_delta=target_delta,
+                stock_ivhv=stock_ivhv
+            )
             
             if not option_data:
                 logger.info(f"  ✗ {symbol}: No suitable put option found")
@@ -304,7 +381,125 @@ class PutScanner:
         except Exception as e:
             logger.error(f"  ✗ {symbol}: Error - {e}", exc_info=True)
             return None
-    
+
+    def _find_put_option_with_conid(
+        self,
+        symbol: str,
+        stock_conid: int,
+        stock_price: float,
+        target_strike: float,
+        expiry_date: date,
+        target_delta: Optional[float] = None,
+        stock_ivhv: Optional[float] = None
+    ) -> Optional[Dict]:
+        """
+        Find a put option near the target strike and expiry using existing conid.
+        
+        Args:
+            symbol: Stock symbol
+            stock_conid: Stock contract ID (already obtained)
+            stock_price: Current stock price
+            target_strike: Target strike price
+            expiry_date: Target expiration date
+            target_delta: Target delta (absolute value) - if provided, finds closest delta
+            stock_ivhv: Stock IV/HV ratio (already calculated)
+            
+        Returns:
+            Dictionary with option data including strike, bid, ask, greeks, IVR
+        """
+        try:
+            # Get configured number of strikes to evaluate
+            num_strikes = 10  # default
+            if hasattr(self.config, 'num_strikes'):
+                num_strikes = self.config.num_strikes
+            
+            # Get options near target strike using the option chain
+            logger.info(f"  Getting option chain for {symbol}...")
+            nearby_strikes = self.client.get_options_near_strike(
+                stock_conid=stock_conid,
+                target_strike=target_strike,
+                expiry_date=expiry_date,
+                right='P',
+                num_strikes=num_strikes
+            )
+            
+            if not nearby_strikes:
+                logger.debug(f"  Reason: No options found near strike ${target_strike:.2f}")
+                return None
+            
+            logger.info(f"  Found {len(nearby_strikes)} strikes near ${target_strike:.2f}")
+            
+            if target_delta:
+                # Use delta-based selection
+                logger.info(f"  Finding option closest to target delta {target_delta:.2f}...")
+                
+                # Prepare batch specs for all strikes
+                batch_specs = []
+                for strike_info in nearby_strikes:
+                    batch_specs.append({
+                        'stock_conid': stock_conid,
+                        'strike': strike_info['strike'],
+                        'expiry_date': expiry_date
+                    })
+                
+                # Batch request all option data
+                logger.info(f"  Batch requesting data for {len(batch_specs)} strikes...")
+                batch_results = self.client.get_options_data_batch(
+                    batch_specs, 
+                    right='P',
+                    skip_preflight=True  # Pre-flight already done in get_options_near_strike()
+                )
+                
+                # Find best delta match
+                best_option = None
+                best_delta_diff = float('inf')
+                tested_count = 0
+                
+                for strike_info, option_result in zip(nearby_strikes, batch_results):
+                    if option_result and option_result.get('delta') is not None:
+                        # Add stock-level IV/HV to the result
+                        option_result['ivr'] = stock_ivhv
+                        
+                        abs_delta = abs(option_result['delta'])
+                        delta_diff = abs(abs_delta - target_delta)
+                        tested_count += 1
+                        
+                        logger.info(f"    ${strike_info['strike']:.0f}: Δ={abs_delta:.3f} (diff: {delta_diff:.3f})")
+                        
+                        if delta_diff < best_delta_diff:
+                            best_delta_diff = delta_diff
+                            best_option = option_result
+                
+                if best_option:
+                    logger.info(f"  Best match: ${best_option['strike']:.0f} with Δ={abs(best_option['delta']):.3f}")
+                    return best_option
+                else:
+                    logger.debug(f"  Reason: Could not find option with valid delta data")
+                    return None
+            
+            else:
+                # Original behavior: use strike closest to target price
+                closest_strike_info = nearby_strikes[0]  # Already sorted by distance
+                
+                result = self.client.get_option_data(
+                    stock_conid=stock_conid,
+                    strike=closest_strike_info['strike'],
+                    expiry_date=expiry_date,
+                    right='P'
+                )
+                
+                if result:
+                    # Add stock-level IV/HV to the result
+                    result['ivr'] = stock_ivhv
+                    return result
+                else:
+                    logger.debug(f"  Reason: Could not get option data for strike ${closest_strike_info['strike']:.0f}")
+                    return None
+                    
+        except Exception as e:
+            logger.debug(f"  Reason: Exception - {e}")
+            return None
+
     def _get_stock_price(self, symbol: str) -> Optional[float]:
         """Get current stock price using IBKR API."""
         try:
@@ -339,106 +534,79 @@ class PutScanner:
             Dictionary with option data including strike, bid, ask, greeks, IVR
         """
         try:
-            # Get stock contract
+            # Get stock contract ID (only search once)
             contracts = self.client.search_contracts(symbol)
             if not contracts:
-                logger.debug(f"  Reason: No contracts found in search")
+                logger.debug(f"  Reason: No contracts found for {symbol}")
                 return None
             
-            # Find stock contract
-            stock_contract = None
+            stock_conid = None
             for contract in contracts:
-                sections = contract.get('sections', [])
-                has_stock = any(section.get('secType') == 'STK' for section in sections)
-                
-                if has_stock and contract.get('symbol') == symbol:
-                    description = contract.get('description', '')
-                    if 'NYSE' in description or 'NASDAQ' in description or description == 'SMART':
-                        stock_contract = contract
+                if contract.get('symbol') == symbol:
+                    sections = contract.get('sections', [])
+                    if any(s.get('secType') == 'STK' for s in sections):
+                        stock_conid = int(contract.get('conid'))
                         break
-                    elif not stock_contract:
-                        stock_contract = contract
             
-            if not stock_contract:
-                logger.debug(f"  Reason: No stock contract found")
-                return None
-            
-            stock_conid = stock_contract.get('conid')
             if not stock_conid:
-                logger.debug(f"  Reason: No conid for stock")
+                logger.debug(f"  Reason: No stock contract found for {symbol}")
                 return None
             
-            # Get IV/HV ratio from the underlying stock
-            stock_ivhv = self._get_stock_ivhv(stock_conid, symbol)  # Add symbol parameter
+            # Get IV/HV ratio from the underlying stock (pass conid to avoid duplicate search)
+            stock_ivhv = self._get_stock_ivhv(stock_conid, symbol)
             if stock_ivhv is None:
                 logger.debug(f"  Reason: Could not get IV/HV ratio for {symbol}")
             else:
                 logger.debug(f"Stock IV/HV ratio for {symbol}: {stock_ivhv:.1f}%")
             
-            # Get option strikes using YYYYMM format
-            month_format = expiry_date.strftime('%Y%m')
+            # Get configured number of strikes to evaluate
+            num_strikes = 10  # default
+            if hasattr(self.config, 'num_strikes'):
+                num_strikes = self.config.num_strikes
             
-            url = f"{self.client.base_url}/iserver/secdef/strikes"
-            params = {
-                'conid': stock_conid,
-                'sectype': 'OPT',
-                'month': month_format,
-                'exchange': 'SMART'
-            }
+            # Get options near target strike using the option chain
+            logger.info(f"  Getting option chain for {symbol}...")
+            nearby_strikes = self.client.get_options_near_strike(
+                stock_conid=stock_conid,
+                target_strike=target_strike,
+                expiry_date=expiry_date,
+                right='P',
+                num_strikes=num_strikes
+            )
             
-            response = self.client._make_request('GET', url, params=params)
-            
-            if response.status_code != 200:
-                logger.debug(f"  Reason: Failed to get strikes (HTTP {response.status_code})")
+            if not nearby_strikes:
+                logger.debug(f"  Reason: No options found near strike ${target_strike:.2f}")
                 return None
             
-            data = response.json()
+            logger.info(f"  Found {len(nearby_strikes)} strikes near ${target_strike:.2f}")
             
-            if not data or not isinstance(data, dict):
-                logger.debug(f"  Reason: Invalid strikes response")
-                return None
-            
-            put_strikes = data.get('put', [])
-            
-            if not put_strikes:
-                logger.debug(f"  Reason: No put strikes available for {month_format}")
-                return None
-            
-            # Get available strikes
-            float_strikes = [float(s) for s in put_strikes]
-            
-            logger.debug(f"Found {len(float_strikes)} strikes for {symbol}")
-            
-            # If target_delta provided, find closest delta match
-            if target_delta is not None:
-                sorted_strikes = sorted(float_strikes, reverse=True)
+            if target_delta:
+                # Use delta-based selection
+                logger.info(f"  Finding option closest to target delta {target_delta:.2f}...")
                 
-                # Find strikes below current stock price (OTM puts)
-                candidates = []
-                for strike in sorted_strikes:
-                    if strike < stock_price:
-                        candidates.append(strike)
+                # Prepare batch specs for all strikes
+                batch_specs = []
+                for strike_info in nearby_strikes:
+                    batch_specs.append({
+                        'stock_conid': stock_conid,
+                        'strike': strike_info['strike'],
+                        'expiry_date': expiry_date
+                    })
                 
-                if not candidates:
-                    logger.debug(f"  Reason: No OTM strikes below ${stock_price:.2f}")
-                    return None
+                # Batch request all option data
+                logger.info(f"  Batch requesting data for {len(batch_specs)} strikes...")
+                batch_results = self.client.get_options_data_batch(
+                    batch_specs, 
+                    right='P',
+                    skip_preflight=True  # Pre-flight already done in get_options_near_strike()
+                )
                 
-                logger.info(f"  Testing strikes from ${candidates[0]:.0f} down for Δ~{target_delta:.2f}")
-                
-                # Get option data for each candidate
+                # Find best delta match
                 best_option = None
                 best_delta_diff = float('inf')
-                prev_delta_diff = float('inf')
                 tested_count = 0
                 
-                for i, strike in enumerate(candidates[:20]):
-                    option_result = self.client.get_option_data(
-                        stock_conid=stock_conid,
-                        strike=strike,
-                        expiry_date=expiry_date,
-                        right='P'
-                    )
-                    
+                for strike_info, option_result in zip(nearby_strikes, batch_results):
                     if option_result and option_result.get('delta') is not None:
                         # Add stock-level IV/HV to the result
                         option_result['ivr'] = stock_ivhv
@@ -447,51 +615,26 @@ class PutScanner:
                         delta_diff = abs(abs_delta - target_delta)
                         tested_count += 1
                         
-                        logger.info(f"    ${strike:.0f}: Δ={abs_delta:.3f} (diff: {delta_diff:.3f})")
+                        logger.info(f"    ${strike_info['strike']:.0f}: Δ={abs_delta:.3f} (diff: {delta_diff:.3f})")
                         
                         if delta_diff < best_delta_diff:
                             best_delta_diff = delta_diff
                             best_option = option_result
-                        
-                        # Stop if delta difference starts increasing
-                        if delta_diff > prev_delta_diff:
-                            logger.info(f"    Delta diff increasing, stopping search")
-                            break
-                        
-                        prev_delta_diff = delta_diff
-                    
-                    if i < 19:
-                        time.sleep(0.3)
                 
                 if best_option:
-                    abs_best_delta = abs(best_option['delta'])
-                    logger.info(f"  Best: ${best_option['strike']:.0f} Δ={abs_best_delta:.3f} (diff: {best_delta_diff:.3f})")
-                    
-                    # Log final result
-                    log_parts = [f"{symbol} ${best_option['strike']:.0f}P"]
-                    
-                    if best_option['bid'] is not None:
-                        log_parts.append(f"bid=${best_option['bid']:.2f}")
-                    if best_option['ask'] is not None:
-                        log_parts.append(f"ask=${best_option['ask']:.2f}")
-                    if best_option['delta'] is not None:
-                        log_parts.append(f"Δ={abs_best_delta:.3f}")
-                    if best_option['implied_vol'] is not None:
-                        log_parts.append(f"IV={best_option['implied_vol']:.1%}")
-                    if best_option['ivr'] is not None:
-                        log_parts.append(f"IV/HV={best_option['ivr']:.1f}%")
-                    
-                    logger.debug(f"✓ {' '.join(log_parts)}")
+                    logger.info(f"  Best match: ${best_option['strike']:.0f} with Δ={abs(best_option['delta']):.3f}")
                     return best_option
                 else:
-                    logger.debug(f"  Reason: No valid delta found after testing {tested_count} strikes")
+                    logger.debug(f"  Reason: Could not find option with valid delta data")
                     return None
+            
             else:
                 # Original behavior: use strike closest to target price
-                closest_strike = min(float_strikes, key=lambda x: abs(x - target_strike))
+                closest_strike_info = nearby_strikes[0]  # Already sorted by distance
+                
                 result = self.client.get_option_data(
                     stock_conid=stock_conid,
-                    strike=closest_strike,
+                    strike=closest_strike_info['strike'],
                     expiry_date=expiry_date,
                     right='P'
                 )
@@ -501,13 +644,77 @@ class PutScanner:
                     result['ivr'] = stock_ivhv
                     return result
                 else:
-                    logger.debug(f"  Reason: Could not get option data for strike ${closest_strike:.0f}")
+                    logger.debug(f"  Reason: Could not get option data for strike ${closest_strike_info['strike']:.0f}")
                     return None
+                    
+        except Exception as e:
+            logger.debug(f"  Reason: Exception - {e}")
+            return None
+
+    def _get_stock_ivhv(self, stock_conid: int, symbol: str) -> Optional[float]:
+        """
+        Get IV/HV ratio for a stock using its conid.
+        
+        Args:
+            stock_conid: Stock contract ID
+            symbol: Stock symbol (for logging)
+            
+        Returns:
+            IV/HV ratio as percentage, or None if unavailable
+        """
+        try:
+            # Get volatility data snapshot (fields 7283=IV, 7088=HV)
+            logger.debug(f"Getting IV/HV for {symbol} (conid: {stock_conid})")
+            
+            snapshots = self.client.get_market_data_snapshot(
+                [stock_conid],
+                fields=['7283', '7088'],  # IV and Historical Volatility
+                ensure_preflight=False
+            )
+            
+            if not snapshots or len(snapshots) == 0:
+                logger.debug(f"No volatility data returned for {symbol}")
+                return None
+            
+            snapshot = snapshots[0]
+            logger.debug(f"{symbol} volatility snapshot: {snapshot}")
+            
+            # Extract IV and HV
+            iv_str = snapshot.get('7283')  # Implied Volatility
+            hv_str = snapshot.get('7088')  # Historical Volatility
+            
+            logger.debug(f"{symbol}: Current IV (7283)={iv_str}, Historical Vol (7088)={hv_str}")
+            
+            if not iv_str or not hv_str:
+                logger.debug(f"Missing IV or HV data for {symbol}")
+                return None
+            
+            # Parse percentages (may be like "20.5%" or "20.5")
+            def parse_pct(val):
+                if isinstance(val, (int, float)):
+                    return float(val)
+                if isinstance(val, str):
+                    return float(val.replace('%', '').strip())
+                return None
+            
+            iv = parse_pct(iv_str)
+            hv = parse_pct(hv_str)
+            
+            if iv is None or hv is None or hv == 0:
+                logger.debug(f"Invalid IV ({iv}) or HV ({hv}) for {symbol}")
+                return None
+            
+            # Calculate IV/HV ratio
+            ivr = (iv / hv) * 100
+            
+            logger.info(f"{symbol} IV/HV: {ivr:.1f}% (IV={iv:.1f}% / HV={hv:.1f}%)")
+            
+            return ivr
             
         except Exception as e:
-            logger.debug(f"  Reason: Exception - {str(e)}")
+            logger.warning(f"Error getting IV/HV for {symbol}: {e}")
             return None
-    
+            
     def _get_next_friday(self) -> date:
         """Get the next Friday's date."""
         today = date.today()
@@ -757,57 +964,6 @@ class PutScanner:
         self._symbol_cache['XLRE'] = symbols
         return symbols
     
-    def _get_stock_ivhv(self, stock_conid: int, symbol: str) -> Optional[float]:
-        """
-        Get IV/HV ratio for the underlying stock as a proxy for IVR.
-        
-        Args:
-            stock_conid: Stock contract ID
-            symbol: Stock symbol (for logging)
-            
-        Returns:
-            IV/HV ratio as a percentage, or None
-        """
-        try:
-            # Get current IV and historical volatility
-            snapshot = self.client.get_market_data_snapshot(
-                stock_conid,
-                fields=['7283', '7088']  # 30-day IV, Historical Vol
-            )
-            
-            if not snapshot:
-                logger.debug(f"{symbol}: No volatility data available")
-                return None
-            
-            logger.debug(f"{symbol} volatility snapshot: {snapshot}")
-            
-            def to_float(val):
-                if val is None:
-                    return None
-                try:
-                    if isinstance(val, str):
-                        val = val.replace('%', '').replace(',', '').lstrip('CH')
-                    return float(val)
-                except (ValueError, TypeError):
-                    return None
-            
-            current_iv = to_float(snapshot.get('7283'))
-            historical_vol = to_float(snapshot.get('7088'))
-            
-            logger.debug(f"{symbol}: Current IV (7283)={current_iv}, Historical Vol (7088)={historical_vol}")
-            
-            if current_iv is not None and historical_vol is not None and historical_vol > 0:
-                iv_hv_ratio = (current_iv / historical_vol) * 100
-                logger.info(f"{symbol} IV/HV: {iv_hv_ratio:.1f}% (IV={current_iv:.1f}% / HV={historical_vol:.1f}%)")
-                return iv_hv_ratio
-            else:
-                logger.debug(f"{symbol}: Insufficient data for IV/HV calculation")
-                return None
-            
-        except Exception as e:
-            logger.debug(f"Error getting IV/HV for {symbol}: {e}", exc_info=True)
-            return None
-    
     def print_results(self, results: List[PutScanResult], top_n: int = 20):
         """
         Print scan results in a formatted table.
@@ -840,4 +996,97 @@ class PutScanner:
                   f"{delta_str:>7} | {mid_str:>8} | {ann_ret_str:>8}")
         
         print("=" * 140)
+
+    def scan_symbols(
+        self,
+        symbols: List[str],
+        target_delta: float = 0.20,
+        expiry_date: Optional[date] = None,
+        strike_pct_below: float = 5.0
+    ) -> List[PutScanResult]:
+        """
+        Scan multiple symbols for put selling opportunities.
+        
+        Args:
+            symbols: List of stock symbols to scan
+            target_delta: Target delta (absolute value) for put options
+            expiry_date: Target expiration date (defaults to next Friday)
+            strike_pct_below: Strike as percentage below current price
+            
+        Returns:
+            List of PutScanResult objects
+        """
+        if not symbols:
+            return []
+        
+        if expiry_date is None:
+            expiry_date = self._get_next_friday()
+        
+        logger.info(f"Scanning {len(symbols)} symbols for puts expiring {expiry_date.strftime('%Y-%m-%d')}...")
+        logger.info(f"Target: Δ~{target_delta:.2f}, Strike ~{strike_pct_below:.1f}% below current price")
+        
+        # Step 1: Get all stock prices in batch
+        logger.info("Step 1: Getting stock prices...")
+        stock_prices = self.client.get_stock_prices_batch(symbols)
+        
+        results = []
+        valid_symbols = []
+        
+        # Filter out symbols with no price
+        for symbol in symbols:
+            price = stock_prices.get(symbol)
+            if price:
+                valid_symbols.append((symbol, price))
+                logger.info(f"  ✓ {symbol}: ${price:.2f}")
+            else:
+                logger.info(f"  ✗ {symbol}: Could not get stock price")
+        
+        if not valid_symbols:
+            logger.info("No valid stock prices found")
+            return []
+        
+        # Step 2: Find options for each symbol
+        logger.info(f"\nStep 2: Finding put options for {len(valid_symbols)} symbols...")
+        
+        for i, (symbol, stock_price) in enumerate(valid_symbols, 1):
+            logger.info(f"Scanning {i}/{len(valid_symbols)}: {symbol}...")
+            
+            # Calculate target strike
+            target_strike = stock_price * (1 - strike_pct_below / 100)
+            
+            # Find the put option
+            option_data = self._find_put_option(
+                symbol=symbol,
+                stock_price=stock_price,
+                target_strike=target_strike,
+                expiry_date=expiry_date,
+                target_delta=target_delta
+            )
+            
+            if option_data:
+                # Create result object
+                result = PutScanResult(
+                    symbol=symbol,
+                    stock_price=stock_price,
+                    strike=option_data['strike'],
+                    expiry=expiry_date,
+                    bid=option_data.get('bid'),
+                    ask=option_data.get('ask'),
+                    mid=(option_data['bid'] + option_data['ask']) / 2 
+                        if option_data.get('bid') and option_data.get('ask') else None,
+                    delta=option_data.get('delta'),
+                    gamma=option_data.get('gamma'),
+                    vega=option_data.get('vega'),
+                    theta=option_data.get('theta'),
+                    implied_vol=option_data.get('implied_vol'),
+                    ivr=option_data.get('ivr'),
+                    volume=option_data.get('volume')
+                )
+                results.append(result)
+                logger.info(f"  ✓ {symbol}: Found suitable put option")
+            else:
+                logger.info(f"  ✗ {symbol}: No suitable put option found")
+        
+        logger.info(f"\nFound {len(results)} total opportunities")
+        return results
 

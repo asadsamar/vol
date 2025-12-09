@@ -30,7 +30,7 @@ sys.path.insert(0, vol_dir)
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -51,8 +51,9 @@ class ScannerConfig:
     days_to_expiry: Optional[int] = None
     min_premium: Optional[float] = None
     min_volume: Optional[int] = None
-    min_annualized_return: Optional[float] = None  # New field
+    min_annualized_return: Optional[float] = None
     top_n: int = 20
+    num_strikes: int = 10  # Number of strikes to evaluate
     
     @classmethod
     def from_file(cls, config_file: str) -> 'ScannerConfig':
@@ -85,8 +86,9 @@ class ScannerConfig:
         days_to_expiry = scan_section.getint('days_to_expiry', fallback=None)
         min_premium = scan_section.getfloat('min_premium', fallback=None)
         min_volume = scan_section.getint('min_volume', fallback=None)
-        min_annualized_return = scan_section.getfloat('min_annualized_return', fallback=None)  # New
+        min_annualized_return = scan_section.getfloat('min_annualized_return', fallback=None)
         top_n = scan_section.getint('top_n', 20)
+        num_strikes = scan_section.getint('num_strikes', 10)  # New
         
         return cls(
             indices=indices,
@@ -98,8 +100,9 @@ class ScannerConfig:
             days_to_expiry=days_to_expiry,
             min_premium=min_premium,
             min_volume=min_volume,
-            min_annualized_return=min_annualized_return,  # New
-            top_n=top_n
+            min_annualized_return=min_annualized_return,
+            top_n=top_n,
+            num_strikes=num_strikes  # New
         )
     
     def __str__(self) -> str:
@@ -188,7 +191,7 @@ class PutScannerStrategy:
             logger.info(f"✓ Connected to IBKR (Account: {self.client.account_id})")
             
             # Initialize scanner
-            self.scanner = PutScanner(self.client)
+            self.scanner = PutScanner(self.client, self.scan_config)
             logger.info("✓ Scanner initialized")
             
             return True
