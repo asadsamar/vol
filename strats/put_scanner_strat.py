@@ -30,7 +30,7 @@ sys.path.insert(0, vol_dir)
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -54,6 +54,7 @@ class ScannerConfig:
     min_annualized_return: Optional[float] = None
     top_n: int = 20
     num_strikes: int = 10  # Number of strikes to evaluate
+    output_file: str = 'results/put_scan_results.csv'
     
     @classmethod
     def from_file(cls, config_file: str) -> 'ScannerConfig':
@@ -88,7 +89,8 @@ class ScannerConfig:
         min_volume = scan_section.getint('min_volume', fallback=None)
         min_annualized_return = scan_section.getfloat('min_annualized_return', fallback=None)
         top_n = scan_section.getint('top_n', 20)
-        num_strikes = scan_section.getint('num_strikes', 10)  # New
+        num_strikes = scan_section.getint('num_strikes', 10)
+        output_file = scan_section.get('output_file', 'results/put_scan_results.csv')
         
         return cls(
             indices=indices,
@@ -102,7 +104,8 @@ class ScannerConfig:
             min_volume=min_volume,
             min_annualized_return=min_annualized_return,
             top_n=top_n,
-            num_strikes=num_strikes  # New
+            num_strikes=num_strikes,
+            output_file=output_file
         )
     
     def __str__(self) -> str:
@@ -265,7 +268,10 @@ class PutScannerStrategy:
             min_ivr=self.scan_config.min_ivr,
             target_delta=self.scan_config.target_delta,  # Pass target_delta
             expiry_date=expiry_date,
-            max_symbols=self.scan_config.max_symbols
+            max_symbols=self.scan_config.max_symbols,
+            min_premium=self.scan_config.min_premium,
+            min_annualized_return=self.scan_config.min_annualized_return,
+            output_file=self.scan_config.output_file
         )
         
         # Apply additional filters
@@ -422,16 +428,90 @@ class PutScannerStrategy:
 
 
 def main():
-    """Main entry point."""
+    """
+    Main entry point for put scanner strategy.
+    """
     import sys
     
-    # Allow config file to be passed as command line argument
-    config_file = "strats/put_scanner.conf"
-    if len(sys.argv) > 1:
-        config_file = sys.argv[1]
+    if len(sys.argv) < 2:
+        print("Usage: python put_scanner_strat.py <config_file>")
+        sys.exit(1)
     
-    strategy = PutScannerStrategy(config_file=config_file)
-    strategy.run()
+    config_file = sys.argv[1]
+    
+    # Load configuration
+    config = ScannerConfig.from_file(config_file)
+    
+    logger.info("PUT SCANNER")
+    logger.info("=" * 80)
+    
+    # Connect to IBKR
+    client = IBWebAPIClient('ibkr/ibkr.conf')
+    
+    if not client.authenticate():
+        logger.error("Failed to authenticate to IBKR")
+        sys.exit(1)
+    
+    if not client.setup_account():
+        logger.error("Failed to setup account")
+        sys.exit(1)
+    
+    logger.info(f"Connected to IBKR (Account: {client.account_id})")
+    
+    # Initialize scanner
+    scanner = PutScanner(client, config)
+    
+    # Determine expiry date
+    expiry_date = None
+    if config.days_to_expiry:
+        expiry_date = date.today() + timedelta(days=config.days_to_expiry)
+    
+    # Scan each index
+    all_results = []
+    
+    for index in config.indices:
+        logger.info(f"\nScanning {index}...")
+        logger.info("-" * 80)
+        
+        results = scanner.scan(
+            index=index,
+            strike_pct_below=config.strike_pct_below,
+            min_ivr=config.min_ivr,
+            target_delta=config.target_delta,
+            expiry_date=expiry_date,
+            max_symbols=config.max_symbols,
+            min_premium=config.min_premium,
+            min_annualized_return=config.min_annualized_return,
+            output_file=config.output_file
+        )
+        
+        all_results.extend(results)
+    
+    # Display top results
+    if all_results:
+        logger.info(f"\n{'=' * 80}")
+        logger.info(f"TOP {config.top_n} OPPORTUNITIES (Sorted by Annualized Return)")
+        logger.info(f"{'=' * 80}")
+        logger.info(f"{'Symbol':<6} {'Expiry':<10} {'Strike':<7} {'Delta':<7} {'IVR':<6} {'AnnRet':<7} {'Premium':<8}")
+        logger.info("-" * 80)
+        
+        # Sort and display top N
+        top_results = all_results[:config.top_n]
+        
+        for result in top_results:
+            ivr_str = f"{result.ivr:.1f}%" if result.ivr else "N/A"
+            ann_ret_str = f"{result.annualized_return:.1f}%" if result.annualized_return else "N/A"
+            delta_str = f"{abs(result.delta):.3f}" if result.delta else "N/A"
+            premium_str = f"${result.mid:.2f}" if result.mid else "N/A"
+            
+            logger.info(
+                f"{result.symbol:<6} {result.expiry.strftime('%Y-%m-%d'):<10} "
+                f"${result.strike:<6.0f} {delta_str:<7} {ivr_str:<6} {ann_ret_str:<7} {premium_str:<8}"
+            )
+        
+        logger.info("=" * 80)
+    else:
+        logger.info("\nNo opportunities found matching criteria")
 
 
 if __name__ == "__main__":

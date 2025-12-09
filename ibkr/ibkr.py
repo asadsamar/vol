@@ -31,9 +31,7 @@ class RateLimiter:
         self.last_call_time = defaultdict(float)
         self.rate_limits = rate_limits
         
-        logger.info("Rate limiter initialized with limits:")
-        for category, limit in rate_limits.items():
-            logger.info(f"  {category}: {limit} req/sec ({1.0/limit:.2f}s interval)")
+        logger.debug("Rate limiter initialized")
     
     def _get_endpoint_category(self, url: str) -> str:
         """
@@ -122,7 +120,7 @@ class IBWebAPIClient:
         self.rate_limiter = RateLimiter(rate_limits)
         
         # Pre-flight setup: Call required endpoints and wait
-        logger.info("Performing pre-flight API setup...")
+        logger.debug("Performing pre-flight API setup...")
         self._preflight_setup()
     
     def _preflight_setup(self):
@@ -136,11 +134,10 @@ class IBWebAPIClient:
         """
         try:
             # Step 1: Call /iserver/accounts (required before market data)
-            logger.info("Step 1: Fetching accounts...")
+            logger.debug("Fetching accounts...")
             accounts = self._fetch_accounts()
             
             if accounts:
-                logger.info(f"  ✓ Found {len(accounts)} account(s)")
                 self.available_accounts = accounts
                 
                 # Auto-setup account
@@ -149,36 +146,23 @@ class IBWebAPIClient:
                 
                 if configured_account and configured_account in account_ids:
                     self.account_id = configured_account
-                    logger.info(f"  ✓ Using configured account: {configured_account}")
-                else:
+                elif account_ids:
                     self.account_id = account_ids[0]
-                    logger.info(f"  ✓ Using first available account: {self.account_id}")
-            else:
-                logger.warning("  ✗ No accounts found, market data may not work")
             
             # Step 2: Make a test market data subscription (helps initialize data streams)
-            logger.info("Step 2: Initializing market data streams...")
-            # Use SPY as test symbol (always available)
+            logger.debug("Initializing market data streams...")
             test_contracts = self.search_contracts('SPY')
             if test_contracts:
                 spy_conid = test_contracts[0].get('conid')
                 if spy_conid:
                     # Make a test market data call (pre-flight request)
-                    test_snapshot = self.get_market_data_snapshot(spy_conid, fields=['31'])
-                    if test_snapshot:
-                        logger.info("  ✓ Market data streams initialized")
-                    else:
-                        logger.info("  ⚠ Market data pre-flight returned no data (this is normal)")
-                else:
-                    logger.info("  ⚠ Could not get SPY conid for test")
-            else:
-                logger.info("  ⚠ Could not find SPY for market data test")
+                    self.get_market_data_snapshot(spy_conid, fields=['31'])
             
             # Step 3: Wait for API to stabilize
-            logger.info("Step 3: Waiting 5 seconds for API to stabilize...")
+            logger.debug("Waiting for API to stabilize...")
             time.sleep(5)
             
-            logger.info("✓ Pre-flight setup complete, API ready for use")
+            logger.debug("Pre-flight setup complete")
             
         except Exception as e:
             logger.error(f"Error during pre-flight setup: {e}")
@@ -286,7 +270,7 @@ class IBWebAPIClient:
         config.set('rate_limits', 'tickle', '0.016')
         
         return config
-    
+        
     def authenticate(self) -> bool:
         """
         Check authentication status and initiate login if needed.
@@ -298,10 +282,9 @@ class IBWebAPIClient:
             response.raise_for_status()
             
             auth_status = response.json()
-            logger.info(f"Authentication status: {auth_status}")
             
             if auth_status.get('authenticated', False):
-                logger.info("Already authenticated")
+                logger.debug("Authenticated to IBKR")
                 return True
             else:
                 logger.warning("Not authenticated. Please authenticate via the Client Portal Gateway web interface.")
@@ -325,11 +308,11 @@ class IBWebAPIClient:
             True if account setup successful, False otherwise
         """
         if self.account_id:
-            logger.info(f"Account already setup: {self.account_id}")
+            logger.debug(f"Account already setup: {self.account_id}")
             return True
         
         # If account wasn't set up during init, try again
-        logger.info("Account not set up, fetching accounts...")
+        logger.debug("Account not set up, fetching accounts...")
         accounts_response = self._fetch_accounts()
         
         if not accounts_response:
@@ -340,9 +323,7 @@ class IBWebAPIClient:
         self.available_accounts = accounts_response
         account_ids = [acc['accountId'] for acc in accounts_response]
         
-        logger.info(f"Found {len(account_ids)} account(s):")
-        for acc in accounts_response:
-            logger.info(f"  - {acc['accountId']}: {acc['accountTitle']} ({acc['tradingType']})")
+        logger.debug(f"Found {len(account_ids)} account(s)")
         
         # Get configured account ID
         configured_account = self.config.get('account', 'account_id', fallback='').strip()
@@ -350,16 +331,15 @@ class IBWebAPIClient:
         if configured_account:
             if configured_account in account_ids:
                 self.account_id = configured_account
-                logger.info(f"Using configured account: {configured_account}")
+                logger.debug(f"Using configured account: {configured_account}")
                 return True
             else:
                 logger.error(f"Configured account '{configured_account}' not found in available accounts")
-                logger.error(f"Available accounts: {account_ids}")
                 return False
         else:
             # Use first account if none configured
             self.account_id = account_ids[0]
-            logger.info(f"No account configured, using first available: {self.account_id}")
+            logger.debug(f"No account configured, using first available: {self.account_id}")
             return True
     
     def _fetch_accounts(self) -> Optional[List[Dict]]:
@@ -1168,98 +1148,75 @@ class IBWebAPIClient:
             if isinstance(strikes_data, dict):
                 if 'call' in strikes_data:
                     call_count = len(strikes_data['call']) if isinstance(strikes_data['call'], list) else 0
-                    logger.info(f"Found {call_count} call strikes")
+                    logger.debug(f"Found {call_count} call strikes")
                 if 'put' in strikes_data:
                     put_count = len(strikes_data['put']) if isinstance(strikes_data['put'], list) else 0
-                    logger.info(f"Found {put_count} put strikes")
+                    logger.debug(f"Found {put_count} put strikes")
             
             return strikes_data
             
         except Exception as e:
             logger.error(f"Error getting strikes: {e}", exc_info=True)
             return None
-    
+
     def get_options_near_strike(
         self,
         stock_conid: int,
         target_strike: float,
         expiry_date: date,
         right: str = 'P',
-        num_strikes: int = 10,
-        exchange: str = 'SMART'
+        num_strikes: int = 10
     ) -> List[Dict]:
         """
-        Get option strikes near a target strike price using proper option chain procedure.
+        Get strikes near a target price for an option chain.
         
         Args:
             stock_conid: Stock contract ID
             target_strike: Target strike price
             expiry_date: Expiration date
             right: 'P' for put, 'C' for call
-            num_strikes: Number of strikes to return (centered around target)
-            exchange: Exchange (default: 'SMART')
+            num_strikes: Number of strikes to return (closest to target)
             
         Returns:
-            List of dicts with 'strike' and 'distance' keys, sorted by distance
+            List of strike dicts with 'strike' and 'distance' keys, sorted by distance
         """
-        try:
-            # Use the proper 3-step procedure to get strikes
-            strikes_data = self.get_option_strikes(stock_conid, expiry_date)
-            
-            if not strikes_data:
-                logger.debug("No strikes data returned")
-                return []
-            
-            # Extract strikes for the requested right (P/C)
-            strikes = []
-            
-            if right == 'P' and 'put' in strikes_data:
-                strikes = strikes_data.get('put', [])
-            elif right == 'C' and 'call' in strikes_data:
-                strikes = strikes_data.get('call', [])
-            elif 'strike' in strikes_data:
-                # Some responses might have a generic 'strike' array
-                strikes = strikes_data.get('strike', [])
-            
-            # Convert to floats
-            float_strikes = []
-            for s in strikes:
-                try:
-                    float_strikes.append(float(s))
-                except (ValueError, TypeError):
-                    continue
-            
-            if not float_strikes:
-                logger.debug(f"No {right} strikes found in response")
-                return []
-            
-            logger.info(f"Found {len(float_strikes)} available {right} strikes")
-            
-            # Calculate distance from target and sort
-            strikes_with_distance = [
-                {
-                    'strike': strike,
-                    'distance': abs(strike - target_strike)
-                }
-                for strike in float_strikes
-            ]
-            
-            strikes_with_distance.sort(key=lambda x: x['distance'])
-            
-            # Return top N closest strikes
-            result = strikes_with_distance[:num_strikes]
-            
-            if result:
-                logger.info(f"Returning {len(result)} strikes closest to ${target_strike:.2f}")
-                closest_strikes_str = ', '.join([f"${s['strike']:.2f}" for s in result[:5]])
-                logger.debug(f"  Closest strikes: {closest_strikes_str}")
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error getting options near strike: {e}", exc_info=True)
+        # Get all available strikes
+        strikes_data = self.get_option_strikes(stock_conid, expiry_date)
+        
+        if not strikes_data:
             return []
-    
+        
+        # Get strikes for the requested right
+        right_key = 'put' if right == 'P' else 'call'
+        available_strikes = strikes_data.get(right_key, [])
+        
+        if not available_strikes:
+            logger.debug(f"No {right_key} strikes available")
+            return []
+        
+        logger.debug(f"Found {len(available_strikes)} available {right} strikes")
+        
+        # Calculate distance from target and sort
+        strike_distances = []
+        for strike in available_strikes:
+            try:
+                strike_val = float(strike)
+                distance = abs(strike_val - target_strike)
+                strike_distances.append({
+                    'strike': strike_val,
+                    'distance': distance
+                })
+            except (ValueError, TypeError):
+                continue
+        
+        # Sort by distance and return closest N strikes
+        strike_distances.sort(key=lambda x: x['distance'])
+        closest_strikes = strike_distances[:num_strikes]
+        
+        logger.debug(f"Returning {len(closest_strikes)} strikes closest to ${target_strike:.2f}")
+        
+        return closest_strikes
+
     def get_options_data_batch(
         self,
         options_specs: List[Dict],
@@ -1291,7 +1248,7 @@ class IBWebAPIClient:
         if not options_specs:
             return []
         
-        logger.info(f"Batch requesting {len(options_specs)} option contracts...")
+        logger.debug(f"Batch requesting {len(options_specs)} option contracts...")
         
         # Only do pre-flight if not already done
         if not skip_preflight:
@@ -1303,7 +1260,7 @@ class IBWebAPIClient:
                     specs_by_underlying[key] = []
                 specs_by_underlying[key].append((i, spec))
             
-            logger.info(f"Grouped into {len(specs_by_underlying)} underlying/expiry combinations")
+            logger.debug(f"Grouped into {len(specs_by_underlying)} underlying/expiry combinations")
             
             # Step 1: For each underlying/expiry, do pre-flight (search + get strikes)
             # This is required once per underlying/expiry combination
@@ -1324,7 +1281,7 @@ class IBWebAPIClient:
         option_conids = []
         option_map = {}  # Map conid to original index
         
-        logger.info("Step 2: Getting option conids for all strikes...")
+        logger.debug("Step 2: Getting option conids for all strikes...")
         for i, spec in enumerate(options_specs):
             try:
                 stock_conid = spec['stock_conid']
@@ -1376,14 +1333,13 @@ class IBWebAPIClient:
                 option_conids.append(None)
         
         valid_conids = [c for c in option_conids if c is not None]
-        logger.info(f"Found {len(valid_conids)}/{len(options_specs)} valid option contracts")
+        logger.debug(f"Found {len(valid_conids)}/{len(options_specs)} valid option contracts")
         
         if not valid_conids:
             return [None] * len(options_specs)
         
         # Step 3: Get market data for ALL options in ONE batch call
-        logger.info(f"Step 3: Requesting market data for ALL {len(valid_conids)} options in ONE batch call...")
-        logger.debug(f"Batch conids: {valid_conids}")
+        logger.debug(f"Step 3: Requesting market data for ALL {len(valid_conids)} options in ONE batch call...")
         
         # Small delay to allow data to populate
         time.sleep(0.5)
@@ -1398,7 +1354,7 @@ class IBWebAPIClient:
             logger.warning("No market data returned from batch request")
             return [None] * len(options_specs)
         
-        logger.info(f"Received {len(snapshots)} snapshots from batch request")
+        logger.debug(f"Received {len(snapshots)} snapshots from batch request")
         
         # Parse and map results back to original order
         results = [None] * len(options_specs)
@@ -1440,7 +1396,7 @@ class IBWebAPIClient:
             }
         
         success_count = sum(1 for r in results if r is not None)
-        logger.info(f"Successfully parsed {success_count}/{len(options_specs)} results")
+        logger.debug(f"Successfully parsed {success_count}/{len(options_specs)} results")
         
         return results
     

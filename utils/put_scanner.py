@@ -7,6 +7,8 @@ import logging
 from dataclasses import dataclass
 import time
 import configparser
+import csv
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +140,10 @@ class PutScanner:
         min_ivr: Optional[float] = None,
         target_delta: Optional[float] = None,
         expiry_date: Optional[date] = None,
-        max_symbols: int = 0
+        max_symbols: int = 0,
+        min_premium: Optional[float] = None,
+        min_annualized_return: Optional[float] = None,
+        output_file: Optional[str] = None
     ) -> List[PutScanResult]:
         """
         Scan for put selling opportunities across an index.
@@ -150,9 +155,12 @@ class PutScanner:
             target_delta: Target delta to match (optional, e.g., 0.20 for ~20% probability)
             expiry_date: Target expiry date (defaults to next Friday)
             max_symbols: Maximum number of symbols to scan (0 = no limit)
+            min_premium: Minimum premium in dollars (optional)
+            min_annualized_return: Minimum annualized return percentage (optional)
+            output_file: Path to save results CSV (optional)
             
         Returns:
-            List of PutScanResult objects sorted by IVR (highest first)
+            List of PutScanResult objects sorted by annualized return
         """
         # Get symbols for the index
         if index.upper() not in self.INDICES:
@@ -164,224 +172,241 @@ class PutScanner:
         # Limit symbols if max_symbols specified
         if max_symbols > 0:
             symbols = all_symbols[:max_symbols]
-            logger.info(f"Limiting to first {max_symbols} of {len(all_symbols)} symbols")
         else:
             symbols = all_symbols
-        
-        logger.info(f"Scanning {len(symbols)} symbols in {index.upper()}...")
         
         # Determine target expiry (next Friday if not specified)
         if expiry_date is None:
             expiry_date = self._get_next_friday()
         
-        logger.info(f"Target expiry: {expiry_date.strftime('%Y-%m-%d')}")
-        logger.info(f"Target strike: {strike_pct_below:.1f}% below current price")
-        if target_delta:
-            logger.info(f"Target delta: {target_delta:.2f}")
-        if min_ivr:
-            logger.info(f"Minimum IV/HV ratio: {min_ivr:.1f}%")
+        days_to_expiry = (expiry_date - date.today()).days
         
-        # Scan each symbol
-        results = []
-        filtered_count = 0
-        no_price_count = 0
-        no_option_count = 0
+        logger.info(f"Scanning {len(symbols)} symbols (Expiry: {expiry_date.strftime('%Y-%m-%d')}, {days_to_expiry}d)")
         
-        for i, symbol in enumerate(symbols):
+        # STEP 1: Search for all symbols and get conids
+        symbol_to_conid = {}
+        
+        for symbol in symbols:
             try:
-                logger.info(f"Scanning {i+1}/{len(symbols)}: {symbol}...")
+                contracts = self.client.search_contracts(symbol)
                 
-                # Add small delay to avoid overwhelming the API
-                if i > 0:
-                    time.sleep(0.5)
+                if not contracts:
+                    logger.info(f"  ✗ {symbol}: No contracts found")
+                    continue
                 
-                result = self._scan_symbol(
-                    symbol=symbol,
-                    strike_pct_below=strike_pct_below,
-                    expiry_date=expiry_date,
-                    target_delta=target_delta
-                )
+                stock_conid = None
+                for contract in contracts:
+                    if contract.get('symbol') == symbol:
+                        sections = contract.get('sections', [])
+                        if any(s.get('secType') == 'STK' for s in sections):
+                            stock_conid = int(contract.get('conid'))
+                            break
                 
-                if result:
-                    # Apply IVR filter
-                    if min_ivr is not None:
-                        if result.ivr is None:
-                            logger.info(f"  ✗ {symbol}: No IV/HV ratio available")
-                            filtered_count += 1
-                            continue
-                        elif result.ivr < min_ivr:
-                            logger.info(f"  ✗ {symbol}: IV/HV {result.ivr:.1f}% < minimum {min_ivr:.1f}%")
-                            filtered_count += 1
-                            continue
-                    
-                    results.append(result)
-                    logger.info(f"  ✓ {result}")
+                if stock_conid:
+                    symbol_to_conid[symbol] = stock_conid
                 else:
-                    # Already logged in _scan_symbol
-                    no_option_count += 1
-                
+                    logger.info(f"  ✗ {symbol}: No stock contract found")
+                    
             except Exception as e:
-                logger.error(f"Error scanning {symbol}: {e}", exc_info=True)
+                logger.info(f"  ✗ {symbol}: Error searching - {e}")
                 continue
         
-        # Sort by IVR (highest first)
-        results.sort(key=lambda r: r.ivr if r.ivr is not None else -1, reverse=True)
+        if not symbol_to_conid:
+            logger.info("No valid contracts found")
+            return []
         
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Scan Summary:")
-        logger.info(f"  Total symbols scanned: {len(symbols)}")
-        logger.info(f"  Opportunities found: {len(results)}")
-        logger.info(f"  Filtered by IVR: {filtered_count}")
-        logger.info(f"  No suitable option: {no_option_count}")
-        logger.info(f"{'='*60}")
+        # STEP 2: Wait for market data subscriptions
+        logger.info(f"Initializing market data for {len(symbol_to_conid)} stocks...")
+        time.sleep(5.0)
         
-        return results
-    
-    def _scan_symbol(
-        self,
-        symbol: str,
-        strike_pct_below: float = 5.0,
-        expiry_date: Optional[date] = None,
-        target_delta: Optional[float] = None
-    ) -> Optional[PutScanResult]:
-        """
-        Scan a single symbol for put selling opportunity.
+        # STEP 3: Batch get market data
+        conids = list(symbol_to_conid.values())
         
-        Args:
-            symbol: Stock ticker symbol
-            strike_pct_below: Percentage below current price to target
-            expiry_date: Target expiry date (defaults to next Friday)
-            target_delta: Target delta to match (optional)
-            
-        Returns:
-            PutScanResult object or None
-        """
-        try:
-            # Get stock contract ID and all market data in one go
-            contracts = self.client.search_contracts(symbol)
-            if not contracts:
-                logger.info(f"  ✗ {symbol}: Could not find contracts")
+        snapshots = self.client.get_market_data_snapshot(
+            conids,
+            fields=['31', '84', '86', '7283', '7088'],
+            ensure_preflight=False
+        )
+        
+        if not snapshots:
+            logger.warning("No market data returned")
+            return []
+        
+        # Parse stock data and apply early filters
+        conid_to_symbol = {v: k for k, v in symbol_to_conid.items()}
+        stock_data = {}
+        
+        def to_float(val):
+            if val is None:
                 return None
-            
-            stock_conid = None
-            for contract in contracts:
-                if contract.get('symbol') == symbol:
-                    sections = contract.get('sections', [])
-                    if any(s.get('secType') == 'STK' for s in sections):
-                        stock_conid = int(contract.get('conid'))
-                        break
-            
-            if not stock_conid:
-                logger.info(f"  ✗ {symbol}: No stock contract found")
+            try:
+                if isinstance(val, str):
+                    val = val.lstrip('CH').replace(',', '')
+                return float(val)
+            except (ValueError, TypeError):
                 return None
+        
+        def parse_pct(val):
+            if isinstance(val, (int, float)):
+                return float(val)
+            if isinstance(val, str):
+                return float(val.replace('%', '').strip())
+            return None
+        
+        for snapshot in snapshots:
+            conid = snapshot.get('conid')
+            if conid not in conid_to_symbol:
+                continue
             
-            # Get ALL data we need in ONE snapshot call: price (31), IV (7283), HV (7088)
-            snapshots = self.client.get_market_data_snapshot(
-                [stock_conid],
-                fields=['31', '84', '86', '7283', '7088'],  # last, bid, ask, IV, HV
-                ensure_preflight=False
-            )
-            
-            if not snapshots or len(snapshots) == 0:
-                logger.info(f"  ✗ {symbol}: No market data available")
-                return None
-            
-            snapshot = snapshots[0]
+            symbol = conid_to_symbol[conid]
             
             # Extract stock price
-            stock_price = None
-            last_price = snapshot.get('31')
-            bid = snapshot.get('84')
-            
-            def to_float(val):
-                if val is None:
-                    return None
-                try:
-                    if isinstance(val, str):
-                        val = val.lstrip('CH').replace(',', '')
-                    return float(val)
-                except (ValueError, TypeError):
-                    return None
-            
-            stock_price = to_float(last_price)
+            stock_price = to_float(snapshot.get('31'))
             if stock_price is None:
-                stock_price = to_float(bid)
+                stock_price = to_float(snapshot.get('84'))
             
             if not stock_price:
-                logger.info(f"  ✗ {symbol}: Could not get stock price")
-                return None
+                logger.info(f"  ✗ {symbol}: No price data")
+                continue
             
-            # Extract and calculate IV/HV ratio
+            # Extract IV/HV
             iv_str = snapshot.get('7283')
             hv_str = snapshot.get('7088')
             
             stock_ivhv = None
             if iv_str and hv_str:
-                def parse_pct(val):
-                    if isinstance(val, (int, float)):
-                        return float(val)
-                    if isinstance(val, str):
-                        return float(val.replace('%', '').strip())
-                    return None
-                
                 iv = parse_pct(iv_str)
                 hv = parse_pct(hv_str)
                 
                 if iv is not None and hv is not None and hv != 0:
                     stock_ivhv = (iv / hv) * 100
-                    logger.debug(f"{symbol} IV/HV: {stock_ivhv:.1f}% (IV={iv:.1f}% / HV={hv:.1f}%)")
             
-            # Calculate target strike
-            target_strike = stock_price * (1 - strike_pct_below / 100)
+            # EARLY FILTER: Check IVR before getting option chain
+            if min_ivr is not None:
+                if stock_ivhv is None:
+                    logger.info(f"  ✗ {symbol}: No IV/HV data")
+                    continue
+                elif stock_ivhv < min_ivr:
+                    logger.info(f"  ✗ {symbol}: IVR {stock_ivhv:.1f}% < min {min_ivr:.1f}%")
+                    continue
             
-            # Use next Friday if no expiry specified
-            if expiry_date is None:
-                expiry_date = self._get_next_friday()
-            
-            # Find put option (pass conid to avoid duplicate search)
-            option_data = self._find_put_option_with_conid(
-                symbol=symbol,
-                stock_conid=stock_conid,
-                stock_price=stock_price,
-                target_strike=target_strike,
-                expiry_date=expiry_date,
-                target_delta=target_delta,
-                stock_ivhv=stock_ivhv
-            )
-            
-            if not option_data:
-                logger.info(f"  ✗ {symbol}: No suitable put option found")
-                return None
-            
-            # Calculate mid price
-            mid_price = None
-            if option_data['bid'] is not None and option_data['ask'] is not None:
-                mid_price = (option_data['bid'] + option_data['ask']) / 2
-            
-            # Create result
-            result = PutScanResult(
-                symbol=symbol,
-                stock_price=stock_price,
-                strike=option_data['strike'],
-                expiry=expiry_date,
-                bid=option_data['bid'],
-                ask=option_data['ask'],
-                mid=mid_price,
-                delta=option_data['delta'],
-                gamma=option_data.get('gamma'),
-                vega=option_data.get('vega'),
-                theta=option_data.get('theta'),
-                implied_vol=option_data['implied_vol'],
-                ivr=option_data['ivr'],
-                volume=option_data.get('volume')
-            )
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"  ✗ {symbol}: Error - {e}", exc_info=True)
-            return None
-
+            stock_data[symbol] = {
+                'price': stock_price,
+                'conid': conid,
+                'ivhv': stock_ivhv
+            }
+        
+        # STEP 4: Find options
+        logger.info(f"\n{'Symbol':<6} {'Expiry':<10} {'Strike':<7} {'Delta':<7} {'IVR':<6} {'AnnRet':<7} Status")
+        logger.info("-" * 80)
+        
+        results = []
+        
+        for symbol, data in stock_data.items():
+            try:
+                # Calculate target strike
+                target_strike = data['price'] * (1 - strike_pct_below / 100)
+                
+                # Find put option
+                option_data = self._find_put_option_with_conid(
+                    symbol=symbol,
+                    stock_conid=data['conid'],
+                    stock_price=data['price'],
+                    target_strike=target_strike,
+                    expiry_date=expiry_date,
+                    target_delta=target_delta,
+                    stock_ivhv=data['ivhv']
+                )
+                
+                if not option_data:
+                    logger.info(f"{symbol:<6} - No suitable option found")
+                    continue
+                
+                # Calculate mid price
+                mid_price = None
+                if option_data['bid'] is not None and option_data['ask'] is not None:
+                    mid_price = (option_data['bid'] + option_data['ask']) / 2
+                
+                # Apply premium filter
+                if min_premium is not None and mid_price is not None:
+                    if mid_price < min_premium:
+                        logger.info(f"{symbol:<6} ${option_data['strike']:<6.0f} Δ{abs(option_data.get('delta', 0)):<6.3f} "
+                                  f"Premium ${mid_price:.2f} < min ${min_premium:.2f}")
+                        continue
+                
+                # Calculate annualized return
+                ann_return = None
+                if mid_price is not None and days_to_expiry > 0:
+                    pct_return = (mid_price / option_data['strike']) * 100
+                    ann_return = (pct_return / days_to_expiry) * 365
+                
+                # Apply annualized return filter
+                if min_annualized_return is not None and ann_return is not None:
+                    if ann_return < min_annualized_return:
+                        logger.info(f"{symbol:<6} ${option_data['strike']:<6.0f} Δ{abs(option_data.get('delta', 0)):<6.3f} "
+                                  f"AnnRet {ann_return:.1f}% < min {min_annualized_return:.1f}%")
+                        continue
+                
+                # Create result
+                result = PutScanResult(
+                    symbol=symbol,
+                    stock_price=data['price'],
+                    strike=option_data['strike'],
+                    expiry=expiry_date,
+                    bid=option_data['bid'],
+                    ask=option_data['ask'],
+                    mid=mid_price,
+                    delta=option_data['delta'],
+                    gamma=option_data.get('gamma'),
+                    vega=option_data.get('vega'),
+                    theta=option_data.get('theta'),
+                    implied_vol=option_data['implied_vol'],
+                    ivr=option_data['ivr'],
+                    volume=option_data.get('volume')
+                )
+                
+                results.append(result)
+                
+                # Print single-line summary
+                ivr_str = f"{result.ivr:.1f}%" if result.ivr else "N/A"
+                ann_ret_str = f"{ann_return:.1f}%" if ann_return else "N/A"
+                delta_str = f"{abs(result.delta):.3f}" if result.delta else "N/A"
+                
+                logger.info(f"{symbol:<6} {expiry_date.strftime('%Y-%m-%d'):<10} "
+                          f"${result.strike:<6.0f} {delta_str:<7} {ivr_str:<6} {ann_ret_str:<7} ✓")
+                
+            except Exception as e:
+                logger.info(f"{symbol:<6} - Error: {str(e)[:40]}")
+                continue
+        
+        # Sort by annualized return
+        results.sort(key=lambda r: (
+            (r.mid / r.strike) * 365 / days_to_expiry * 100 
+            if r.mid and days_to_expiry > 0 
+            else (r.ivr if r.ivr else -1)
+        ), reverse=True)
+        
+        logger.info("-" * 80)
+        logger.info(f"Found {len(results)} opportunities")
+        
+        # Save results to CSV if output file specified
+        if output_file and results:
+            scan_params = {
+                'Index': index.upper(),
+                'Target Expiry': expiry_date.strftime('%Y-%m-%d'),
+                'Days to Expiry': days_to_expiry,
+                'Strike %': f"{strike_pct_below}%",
+                'Target Delta': target_delta if target_delta else 'N/A',
+                'Min IVR': f"{min_ivr}%" if min_ivr else 'N/A',
+                'Min Premium': f"${min_premium}" if min_premium else 'N/A',
+                'Min Ann. Return': f"{min_annualized_return}%" if min_annualized_return else 'N/A',
+                'Total Scanned': len(symbols),
+                'Passed Filters': len(results)
+            }
+            self.save_results_to_csv(results, output_file, scan_params)
+        
+        return results
+    
     def _find_put_option_with_conid(
         self,
         symbol: str,
@@ -394,6 +419,7 @@ class PutScanner:
     ) -> Optional[Dict]:
         """
         Find a put option near the target strike and expiry using existing conid.
+        Simplified to avoid verbose logging.
         
         Args:
             symbol: Stock symbol
@@ -414,7 +440,6 @@ class PutScanner:
                 num_strikes = self.config.num_strikes
             
             # Get options near target strike using the option chain
-            logger.info(f"  Getting option chain for {symbol}...")
             nearby_strikes = self.client.get_options_near_strike(
                 stock_conid=stock_conid,
                 target_strike=target_strike,
@@ -424,15 +449,10 @@ class PutScanner:
             )
             
             if not nearby_strikes:
-                logger.debug(f"  Reason: No options found near strike ${target_strike:.2f}")
                 return None
-            
-            logger.info(f"  Found {len(nearby_strikes)} strikes near ${target_strike:.2f}")
             
             if target_delta:
                 # Use delta-based selection
-                logger.info(f"  Finding option closest to target delta {target_delta:.2f}...")
-                
                 # Prepare batch specs for all strikes
                 batch_specs = []
                 for strike_info in nearby_strikes:
@@ -443,7 +463,6 @@ class PutScanner:
                     })
                 
                 # Batch request all option data
-                logger.info(f"  Batch requesting data for {len(batch_specs)} strikes...")
                 batch_results = self.client.get_options_data_batch(
                     batch_specs, 
                     right='P',
@@ -453,7 +472,6 @@ class PutScanner:
                 # Find best delta match
                 best_option = None
                 best_delta_diff = float('inf')
-                tested_count = 0
                 
                 for strike_info, option_result in zip(nearby_strikes, batch_results):
                     if option_result and option_result.get('delta') is not None:
@@ -462,20 +480,12 @@ class PutScanner:
                         
                         abs_delta = abs(option_result['delta'])
                         delta_diff = abs(abs_delta - target_delta)
-                        tested_count += 1
-                        
-                        logger.info(f"    ${strike_info['strike']:.0f}: Δ={abs_delta:.3f} (diff: {delta_diff:.3f})")
                         
                         if delta_diff < best_delta_diff:
                             best_delta_diff = delta_diff
                             best_option = option_result
                 
-                if best_option:
-                    logger.info(f"  Best match: ${best_option['strike']:.0f} with Δ={abs(best_option['delta']):.3f}")
-                    return best_option
-                else:
-                    logger.debug(f"  Reason: Could not find option with valid delta data")
-                    return None
+                return best_option
             
             else:
                 # Original behavior: use strike closest to target price
@@ -493,11 +503,10 @@ class PutScanner:
                     result['ivr'] = stock_ivhv
                     return result
                 else:
-                    logger.debug(f"  Reason: Could not get option data for strike ${closest_strike_info['strike']:.0f}")
                     return None
                     
         except Exception as e:
-            logger.debug(f"  Reason: Exception - {e}")
+            logger.debug(f"Error finding option for {symbol}: {e}")
             return None
 
     def _get_stock_price(self, symbol: str) -> Optional[float]:
@@ -1089,4 +1098,60 @@ class PutScanner:
         
         logger.info(f"\nFound {len(results)} total opportunities")
         return results
+
+    def save_results_to_csv(self, results: List[PutScanResult], output_file: str, scan_params: Optional[Dict] = None):
+        """
+        Save scan results to CSV file.
+        
+        Args:
+            results: List of PutScanResult objects
+            output_file: Path to output CSV file
+            scan_params: Optional dict with scan parameters to include as header comments
+        """
+        try:
+            # Create output directory if it doesn't exist
+            output_path = Path(output_file)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(output_file, 'w', newline='') as csvfile:
+                # Write header comments with scan parameters
+                if scan_params:
+                    csvfile.write(f"# Scan Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    for key, value in scan_params.items():
+                        csvfile.write(f"# {key}: {value}\n")
+                    csvfile.write("#\n")
+                
+                # Define CSV columns - only essential data
+                fieldnames = [
+                    'symbol', 'stock_price', 'strike', 'strike_pct_otm', 'expiry', 
+                    'days_to_expiry', 'bid', 'ask', 'mid', 'delta', 
+                    'implied_vol', 'ivr', 'annualized_return'
+                ]
+                
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                # Write results
+                for result in results:
+                    writer.writerow({
+                        'symbol': result.symbol,
+                        'stock_price': f"{result.stock_price:.2f}",
+                        'strike': f"{result.strike:.2f}",
+                        'strike_pct_otm': f"{result.strike_pct_otm:.2f}",
+                        'expiry': result.expiry.strftime('%Y-%m-%d'),
+                        'days_to_expiry': result.days_to_expiry,
+                        'bid': f"{result.bid:.2f}" if result.bid else '',
+                        'ask': f"{result.ask:.2f}" if result.ask else '',
+                        'mid': f"{result.mid:.2f}" if result.mid else '',
+                        'delta': f"{result.delta:.4f}" if result.delta else '',
+                        'implied_vol': f"{result.implied_vol:.4f}" if result.implied_vol else '',
+                        'ivr': f"{result.ivr:.2f}" if result.ivr else '',
+                        'annualized_return': f"{result.annualized_return:.2f}" if result.annualized_return else ''
+                    })
+            
+            logger.info(f"Results saved to: {output_file}")
+            logger.info(f"  Total records: {len(results)}")
+            
+        except Exception as e:
+            logger.error(f"Error saving results to CSV: {e}", exc_info=True)
 
