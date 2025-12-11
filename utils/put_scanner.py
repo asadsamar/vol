@@ -10,6 +10,8 @@ import configparser
 import csv
 from pathlib import Path
 
+from utils.index_constituents import IndexConstituents
+
 logger = logging.getLogger(__name__)
 
 
@@ -98,7 +100,7 @@ class PutScanResult:
 
 class PutScanner:
     """Scanner for finding put selling opportunities."""
-    
+
     def __init__(self, client: 'IBWebAPIClient', config: Optional[configparser.ConfigParser] = None):
         """
         Initialize the put scanner.
@@ -109,29 +111,6 @@ class PutScanner:
         """
         self.client = client
         self.config = config
-        
-        # Cache for index constituents
-        self._symbol_cache = {}
-        
-        # Common indices and their symbols
-        self.INDICES = {
-            'SPX': self._get_spx_symbols,
-            'SP500': self._get_spx_symbols,  # Alias
-            'NDX': self._get_ndx_symbols,
-            'NASDAQ100': self._get_ndx_symbols,  # Alias
-            'DJI': self._get_dji_symbols,
-            'DOW': self._get_dji_symbols,  # Alias
-            'XLE': self._get_xle_symbols,  # Energy
-            'XLF': self._get_xlf_symbols,  # Financials
-            'XLK': self._get_xlk_symbols,  # Technology
-            'XLV': self._get_xlv_symbols,  # Healthcare
-            'XLI': self._get_xli_symbols,  # Industrials
-            'XLP': self._get_xlp_symbols,  # Consumer Staples
-            'XLY': self._get_xly_symbols,  # Consumer Discretionary
-            'XLU': self._get_xlu_symbols,  # Utilities
-            'XLB': self._get_xlb_symbols,  # Materials
-            'XLRE': self._get_xlre_symbols,  # Real Estate
-        }
     
     def scan(
         self,
@@ -842,247 +821,6 @@ class PutScanner:
         if days_until_friday == 0:
             days_until_friday = 7  # If today is Friday, get next Friday
         return today + timedelta(days=days_until_friday)
-    
-    def _get_spx_symbols(self) -> List[str]:
-        """Get S&P 500 constituent symbols from Yahoo Finance."""
-        if 'SPX' in self._symbol_cache:
-            return self._symbol_cache['SPX']
-        
-        try:
-            import yahoo_fin.stock_info as si
-            logger.info("Fetching S&P 500 constituents from Yahoo Finance...")
-            symbols = si.tickers_sp500()
-            
-            # Clean up symbols (remove any with special characters that might cause issues)
-            symbols = [s for s in symbols if '.' not in s and '^' not in s]
-            
-            logger.info(f"Loaded {len(symbols)} S&P 500 symbols")
-            self._symbol_cache['SPX'] = symbols
-            return symbols
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch S&P 500 symbols: {e}")
-            logger.warning("Falling back to hardcoded liquid names")
-            # Fallback to liquid names
-            return [
-                'SPY', 'AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL', 'META', 'TSLA',
-                'BRK.B', 'UNH', 'JNJ', 'XOM', 'JPM', 'V', 'PG', 'MA', 'HD', 'CVX',
-                'MRK', 'ABBV', 'KO', 'AVGO', 'PEP', 'COST', 'WMT', 'MCD', 'CSCO'
-            ]
-    
-    def _get_ndx_symbols(self) -> List[str]:
-        """Get NASDAQ-100 constituent symbols from Yahoo Finance."""
-        if 'NDX' in self._symbol_cache:
-            return self._symbol_cache['NDX']
-        
-        try:
-            import yahoo_fin.stock_info as si
-            logger.info("Fetching NASDAQ-100 constituents from Yahoo Finance...")
-            symbols = si.tickers_nasdaq()
-            
-            # NASDAQ-100 is a subset - for now use the full NASDAQ list
-            # or we can manually maintain the list
-            # Clean up symbols
-            symbols = [s for s in symbols if '.' not in s and '^' not in s]
-            
-            # Limit to most liquid/recognizable names for now
-            # TODO: Get actual NASDAQ-100 list
-            liquid_nasdaq = [
-                'AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL', 'GOOG', 'META', 'TSLA', 'AVGO',
-                'COST', 'NFLX', 'ADBE', 'CSCO', 'PEP', 'AMD', 'INTC', 'INTU',
-                'QCOM', 'AMAT', 'SBUX', 'ISRG', 'TXN', 'MU', 'ADI', 'PYPL',
-                'BKNG', 'CMCSA', 'TMUS', 'AMGN', 'VRTX', 'MDLZ', 'GILD', 'ADP',
-                'LRCX', 'REGN', 'PANW', 'ABNB', 'SNPS', 'CDNS', 'KLAC', 'MELI',
-                'MAR', 'ORLY', 'ASML', 'FTNT', 'NXPI', 'WDAY', 'DASH', 'TEAM'
-            ]
-            
-            logger.info(f"Using {len(liquid_nasdaq)} liquid NASDAQ symbols")
-            self._symbol_cache['NDX'] = liquid_nasdaq
-            return liquid_nasdaq
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch NASDAQ symbols: {e}")
-            logger.warning("Falling back to hardcoded list")
-            return [
-                'AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL', 'META', 'TSLA', 'AVGO',
-                'COST', 'NFLX', 'ADBE', 'CSCO', 'AMD', 'INTC', 'INTU', 'QCOM'
-            ]
-    
-    def _get_dji_symbols(self) -> List[str]:
-        """Get Dow Jones Industrial Average constituent symbols from Yahoo Finance."""
-        if 'DJI' in self._symbol_cache:
-            return self._symbol_cache['DJI']
-        
-        try:
-            import yahoo_fin.stock_info as si
-            logger.info("Fetching Dow Jones constituents from Yahoo Finance...")
-            symbols = si.tickers_dow()
-            
-            logger.info(f"Loaded {len(symbols)} Dow Jones symbols")
-            self._symbol_cache['DJI'] = symbols
-            return symbols
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch Dow Jones symbols: {e}")
-            logger.warning("Falling back to hardcoded list")
-            return [
-                'AAPL', 'MSFT', 'UNH', 'GS', 'HD', 'CAT', 'MCD', 'AMGN', 'V',
-                'BA', 'TRV', 'AXP', 'JPM', 'IBM', 'JNJ', 'PG', 'CVX', 'MRK',
-                'WMT', 'DIS', 'NKE', 'MMM', 'KO', 'DOW', 'CSCO', 'VZ', 'INTC',
-                'WBA', 'HON', 'CRM'
-            ]
-    
-    def _get_xle_symbols(self) -> List[str]:
-        """Get XLE (Energy Select Sector) holdings."""
-        if 'XLE' in self._symbol_cache:
-            return self._symbol_cache['XLE']
-        
-        # Major XLE holdings
-        symbols = [
-            'XOM', 'CVX', 'COP', 'EOG', 'SLB', 'MPC', 'PSX', 'VLO',
-            'OXY', 'WMB', 'HES', 'KMI', 'HAL', 'DVN', 'FANG', 'BKR',
-            'LNG', 'TRGP', 'EQT', 'OKE', 'CTRA', 'MRO', 'APA'
-        ]
-        
-        logger.info(f"Loaded {len(symbols)} XLE (Energy) symbols")
-        self._symbol_cache['XLE'] = symbols
-        return symbols
-    
-    def _get_xlf_symbols(self) -> List[str]:
-        """Get XLF (Financial Select Sector) holdings."""
-        if 'XLF' in self._symbol_cache:
-            return self._symbol_cache['XLF']
-        
-        symbols = [
-            'BRK.B', 'JPM', 'V', 'MA', 'BAC', 'WFC', 'GS', 'MS', 'SPGI',
-            'AXP', 'C', 'BLK', 'SCHW', 'CB', 'MMC', 'PGR', 'AON', 'USB',
-            'TFC', 'AIG', 'MET', 'AFL', 'ALL', 'PRU', 'AJG', 'COF'
-        ]
-        
-        logger.info(f"Loaded {len(symbols)} XLF (Financial) symbols")
-        self._symbol_cache['XLF'] = symbols
-        return symbols
-    
-    def _get_xlk_symbols(self) -> List[str]:
-        """Get XLK (Technology Select Sector) holdings."""
-        if 'XLK' in self._symbol_cache:
-            return self._symbol_cache['XLK']
-        
-        symbols = [
-            'AAPL', 'MSFT', 'NVDA', 'AVGO', 'CSCO', 'ADBE', 'CRM', 'ACN',
-            'AMD', 'INTC', 'QCOM', 'INTU', 'TXN', 'AMAT', 'NOW', 'ORCL',
-            'IBM', 'PANW', 'ADI', 'MU', 'LRCX', 'KLAC', 'SNPS', 'CDNS',
-            'PLTR', 'ANET', 'APH', 'ADSK', 'MSI', 'FTNT'
-        ]
-        
-        logger.info(f"Loaded {len(symbols)} XLK (Technology) symbols")
-        self._symbol_cache['XLK'] = symbols
-        return symbols
-    
-    def _get_xlv_symbols(self) -> List[str]:
-        """Get XLV (Healthcare Select Sector) holdings."""
-        if 'XLV' in self._symbol_cache:
-            return self._symbol_cache['XLV']
-        
-        symbols = [
-            'UNH', 'JNJ', 'LLY', 'ABBV', 'MRK', 'TMO', 'ABT', 'AMGN', 'DHR',
-            'PFE', 'BMY', 'CVS', 'VRTX', 'GILD', 'ELV', 'CI', 'REGN', 'MCK',
-            'ZTS', 'BSX', 'MDT', 'SYK', 'ISRG', 'HCA', 'BDX', 'EW'
-        ]
-        
-        logger.info(f"Loaded {len(symbols)} XLV (Healthcare) symbols")
-        self._symbol_cache['XLV'] = symbols
-        return symbols
-    
-    def _get_xli_symbols(self) -> List[str]:
-        """Get XLI (Industrial Select Sector) holdings."""
-        if 'XLI' in self._symbol_cache:
-            return self._symbol_cache['XLI']
-        
-        symbols = [
-            'GE', 'CAT', 'RTX', 'HON', 'UNP', 'BA', 'UPS', 'ADP', 'DE',
-            'LMT', 'TT', 'GD', 'MMM', 'NOC', 'ETN', 'EMR', 'ITW', 'CSX',
-            'WM', 'PH', 'NSC', 'CARR', 'PCAR', 'FDX', 'JCI', 'ODFL'
-        ]
-        
-        logger.info(f"Loaded {len(symbols)} XLI (Industrial) symbols")
-        self._symbol_cache['XLI'] = symbols
-        return symbols
-    
-    def _get_xlp_symbols(self) -> List[str]:
-        """Get XLP (Consumer Staples Select Sector) holdings."""
-        if 'XLP' in self._symbol_cache:
-            return self._symbol_cache['XLP']
-        
-        symbols = [
-            'PG', 'KO', 'PEP', 'COST', 'WMT', 'PM', 'MO', 'MDLZ', 'CL',
-            'MNST', 'KMB', 'GIS', 'STZ', 'KHC', 'SYY', 'HSY', 'K', 'CHD',
-            'TSN', 'CAG', 'MKC', 'CPB', 'HRL', 'SJM'
-        ]
-        
-        logger.info(f"Loaded {len(symbols)} XLP (Consumer Staples) symbols")
-        self._symbol_cache['XLP'] = symbols
-        return symbols
-    
-    def _get_xly_symbols(self) -> List[str]:
-        """Get XLY (Consumer Discretionary Select Sector) holdings."""
-        if 'XLY' in self._symbol_cache:
-            return self._symbol_cache['XLY']
-        
-        symbols = [
-            'AMZN', 'TSLA', 'HD', 'MCD', 'NKE', 'LOW', 'SBUX', 'TJX', 'BKNG',
-            'CMG', 'MAR', 'ABNB', 'GM', 'F', 'DHI', 'LEN', 'YUM', 'ORLY',
-            'DG', 'ROST', 'AZO', 'GRMN', 'DECK', 'ULTA', 'TPR'
-        ]
-        
-        logger.info(f"Loaded {len(symbols)} XLY (Consumer Discretionary) symbols")
-        self._symbol_cache['XLY'] = symbols
-        return symbols
-    
-    def _get_xlu_symbols(self) -> List[str]:
-        """Get XLU (Utilities Select Sector) holdings."""
-        if 'XLU' in self._symbol_cache:
-            return self._symbol_cache['XLU']
-        
-        symbols = [
-            'NEE', 'SO', 'DUK', 'CEG', 'SRE', 'AEP', 'D', 'PEG', 'VST',
-            'EXC', 'XEL', 'ED', 'ETR', 'WEC', 'ES', 'AWK', 'FE', 'AEE',
-            'DTE', 'PPL', 'ATO', 'CMS', 'NI', 'LNT'
-        ]
-        
-        logger.info(f"Loaded {len(symbols)} XLU (Utilities) symbols")
-        self._symbol_cache['XLU'] = symbols
-        return symbols
-    
-    def _get_xlb_symbols(self) -> List[str]:
-        """Get XLB (Materials Select Sector) holdings."""
-        if 'XLB' in self._symbol_cache:
-            return self._symbol_cache['XLB']
-        
-        symbols = [
-            'LIN', 'APD', 'SHW', 'FCX', 'ECL', 'NEM', 'CTVA', 'DOW', 'DD',
-            'NUE', 'VMC', 'MLM', 'PPG', 'IFF', 'STLD', 'IP', 'PKG', 'BALL',
-            'AVY', 'CF', 'MOS', 'FMC', 'ALB'
-        ]
-        
-        logger.info(f"Loaded {len(symbols)} XLB (Materials) symbols")
-        self._symbol_cache['XLB'] = symbols
-        return symbols
-    
-    def _get_xlre_symbols(self) -> List[str]:
-        """Get XLRE (Real Estate Select Sector) holdings."""
-        if 'XLRE' in self._symbol_cache:
-            return self._symbol_cache['XLRE']
-        
-        symbols = [
-            'PLD', 'AMT', 'EQIX', 'CCI', 'PSA', 'WELL', 'DLR', 'O', 'CBRE',
-            'SPG', 'EXR', 'IRM', 'AVB', 'VICI', 'VTR', 'EQR', 'SBAC', 'WY',
-            'INVH', 'MAA', 'ARE', 'ESS', 'KIM', 'DOC', 'UDR'
-        ]
-        
-        logger.info(f"Loaded {len(symbols)} XLRE (Real Estate) symbols")
-        self._symbol_cache['XLRE'] = symbols
-        return symbols
     
     def print_results(self, results: List[PutScanResult], top_n: int = 20):
         """
