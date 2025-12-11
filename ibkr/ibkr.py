@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta
 from threading import Lock
 from collections import defaultdict
 
-logging.basicConfig(level=logging.INFO)
+#logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
@@ -106,10 +106,6 @@ class IBWebAPIClient:
         self.session.verify = False
         # Suppress SSL warnings
         requests.packages.urllib3.disable_warnings()
-        
-        # Set logging level from config
-        log_level = self.config.get('logging', 'level', fallback='INFO')
-        logger.setLevel(getattr(logging, log_level))
         
         # Account setup
         self.account_id = None
@@ -270,7 +266,7 @@ class IBWebAPIClient:
         config.set('rate_limits', 'tickle', '0.016')
         
         return config
-        
+
     def authenticate(self) -> bool:
         """
         Check authentication status and initiate login if needed.
@@ -1308,17 +1304,33 @@ class IBWebAPIClient:
                     continue
                 
                 option_data = secdef_response.json()
+                
+                # LOG THE RAW RESPONSE
+                logger.debug(f"  Strike ${strike}: Raw response type={type(option_data)}, data={option_data}")
+                
                 target_expiry_str = expiry_date.strftime('%Y%m%d');
                 
                 option_conid = None
                 if isinstance(option_data, list):
-                    for contract in option_data:
-                        if contract.get('maturityDate') == target_expiry_str:
-                            option_conid = contract.get('conid')
-                            break
+                    logger.debug(f"  Strike ${strike}: Got list with {len(option_data)} items")
+                    # Sort by expiry date to find nearest valid expiry within window
+                    for contract in sorted(option_data, key=lambda c: c.get('maturityDate', '')):
+                        contract_expiry = contract.get('maturityDate')
+                        logger.debug(f"    Contract expiry={contract_expiry}, target={target_expiry_str}")
+                        if contract_expiry:
+                            contract_date = datetime.strptime(contract_expiry, '%Y%m%d').date()
+                            # Accept if within max_days window (on or before target date)
+                            if contract_date <= expiry_date:
+                                option_conid = contract.get('conid')
+                                logger.debug(f"    Using expiry {contract_expiry} (within {expiry_date} window)")
+                                break
                 elif isinstance(option_data, dict):
-                    if option_data.get('maturityDate') == target_expiry_str:
-                        option_conid = option_data.get('conid')
+                    contract_expiry = option_data.get('maturityDate')
+                    logger.debug(f"  Strike ${strike}: Got dict, expiry={contract_expiry}, target={target_expiry_str}")
+                    if contract_expiry:
+                        contract_date = datetime.strptime(contract_expiry, '%Y%m%d').date()
+                        if contract_date <= expiry_date:
+                            option_conid = option_data.get('conid')
                 
                 if option_conid:
                     option_conids.append(option_conid)
@@ -1353,6 +1365,25 @@ class IBWebAPIClient:
         if not snapshots:
             logger.warning("No market data returned from batch request")
             return [None] * len(options_specs)
+        
+        # Check if we got preflight response (only metadata, no actual data)
+        metadata_keys = {'conid', 'conidEx', '_updated', 'server_id', '6119', '6509'}
+        has_data_count = sum(
+            1 for snapshot in snapshots 
+            if any(key not in metadata_keys for key in snapshot.keys())
+        )
+        
+        if has_data_count == 0:
+            logger.debug("Preflight response received, waiting and retrying...")
+            time.sleep(2)
+            snapshots = self.get_market_data_snapshot(
+                valid_conids,
+                fields=['31', '84', '86', '87', '7308', '7309', '7310', '7311', '7633'],
+                ensure_preflight=False
+            )
+            if not snapshots:
+                logger.warning("No market data on retry")
+                return [None] * len(options_specs)
         
         logger.debug(f"Received {len(snapshots)} snapshots from batch request")
         

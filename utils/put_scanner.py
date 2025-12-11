@@ -138,12 +138,15 @@ class PutScanner:
         index: str,
         strike_pct_below: float = 5.0,
         min_ivr: Optional[float] = None,
-        target_delta: Optional[float] = None,
+        max_delta: Optional[float] = None,
         expiry_date: Optional[date] = None,
         max_symbols: int = 0,
         min_premium: Optional[float] = None,
         min_annualized_return: Optional[float] = None,
-        output_file: Optional[str] = None
+        max_days_to_expiry: Optional[int] = None,
+        output_file: Optional[str] = None,
+        test_symbol: Optional[str] = None,  # NEW parameter
+        test_symbols: Optional[List[str]] = None  # NEW parameter for multiple test symbols
     ) -> List[PutScanResult]:
         """
         Scan for put selling opportunities across an index.
@@ -152,36 +155,56 @@ class PutScanner:
             index: Index name (e.g., 'SPX', 'SP500', 'NDX', 'NASDAQ100')
             strike_pct_below: Percentage below current price to target (default: 5%)
             min_ivr: Minimum IVR to filter (optional)
-            target_delta: Target delta to match (optional, e.g., 0.20 for ~20% probability)
-            expiry_date: Target expiry date (defaults to next Friday)
-            max_symbols: Maximum number of symbols to scan (0 = no limit)
+            max_delta: Maximum delta (absolute value) - only consider options with delta <= this
+            expiry_date: Target expiry date (optional, defaults to next Friday)
+            max_symbols: DEPRECATED - scans entire index (kept for backwards compatibility)
             min_premium: Minimum premium in dollars (optional)
             min_annualized_return: Minimum annualized return percentage (optional)
+            max_days_to_expiry: Maximum days to expiry filter (optional)
             output_file: Path to save results CSV (optional)
+            test_symbol: If provided, scan only this symbol instead of entire index (optional)
+            test_symbols: If provided, scan only these symbols instead of entire index (optional)
             
         Returns:
             List of PutScanResult objects sorted by annualized return
         """
-        # Get symbols for the index
-        if index.upper() not in self.INDICES:
-            logger.error(f"Unknown index: {index}. Available: {list(self.INDICES.keys())}")
-            return []
-        
-        all_symbols = self.INDICES[index.upper()]()
+        # NEW: If test_symbol is provided, use it instead of fetching index constituents
+        if test_symbol:
+            symbols = [test_symbol.upper()]
+            logger.info(f"TEST MODE: Scanning single symbol {test_symbol.upper()}")
+        # If test_symbols are provided, use them instead of fetching index constituents
+        if test_symbols:
+            symbols = test_symbols
+            logger.info(f"TEST MODE: Scanning {len(test_symbols)} symbols: {', '.join(test_symbols)}")
+        else:
+            # Get symbols for the index using IndexConstituents utility
+            symbols = IndexConstituents.get_constituents(index)
+            
+            if not symbols:
+                logger.error(f"Could not get constituents for index: {index}")
+                return []
         
         # Limit symbols if max_symbols specified
         if max_symbols > 0:
-            symbols = all_symbols[:max_symbols]
+            symbols = symbols[:max_symbols]
+        
+        # Determine expiry date window
+        max_expiry = None
+        if max_days_to_expiry is not None:
+            max_expiry = date.today() + timedelta(days=max_days_to_expiry)
+            logger.info(f"Looking for options expiring within {max_days_to_expiry} days (by {max_expiry.strftime('%Y-%m-%d')})")
+        elif expiry_date is not None:
+            # If specific expiry date provided, use it
+            max_expiry = expiry_date
+            logger.info(f"Looking for options expiring on {expiry_date.strftime('%Y-%m-%d')}")
         else:
-            symbols = all_symbols
+            # Default to next Friday (7 days max)
+            max_expiry = date.today() + timedelta(days=7)
+            logger.info(f"No expiry specified, looking within 7 days (by {max_expiry.strftime('%Y-%m-%d')})")
         
-        # Determine target expiry (next Friday if not specified)
-        if expiry_date is None:
-            expiry_date = self._get_next_friday()
+        days_to_expiry = (max_expiry - date.today()).days
         
-        days_to_expiry = (expiry_date - date.today()).days
-        
-        logger.info(f"Scanning {len(symbols)} symbols (Expiry: {expiry_date.strftime('%Y-%m-%d')}, {days_to_expiry}d)")
+        logger.info(f"Scanning {len(symbols)} symbols (Expiry: {max_expiry.strftime('%Y-%m-%d')}, {days_to_expiry}d)")
         
         # STEP 1: Search for all symbols and get conids
         symbol_to_conid = {}
@@ -215,24 +238,43 @@ class PutScanner:
             logger.info("No valid contracts found")
             return []
         
-        # STEP 2: Wait for market data subscriptions
+        # STEP 2: Get market data for all stocks
         logger.info(f"Initializing market data for {len(symbol_to_conid)} stocks...")
-        time.sleep(5.0)
         
-        # STEP 3: Batch get market data
+        # Get conids list (already obtained in STEP 1)
         conids = list(symbol_to_conid.values())
         
+        # Wait before requesting market data
+        time.sleep(5)
+        
+        # Get market data for all stocks in one batch call
         snapshots = self.client.get_market_data_snapshot(
             conids,
-            fields=['31', '84', '86', '7283', '7088'],
-            ensure_preflight=False
+            fields=['31', '84', '86', '7283', '7088']
         )
         
         if not snapshots:
             logger.warning("No market data returned")
             return []
         
-        # Parse stock data and apply early filters
+        # Check if we got preflight responses and retry if needed
+        metadata_keys = {'conid', 'conidEx', '_updated', 'server_id', '6119', '6509'}
+        has_data = any(
+            any(key not in metadata_keys for key in snapshot.keys())
+            for snapshot in snapshots
+        )
+        
+        if not has_data:
+            logger.debug("Preflight response received, waiting and retrying...")
+            time.sleep(2)
+            snapshots = self.client.get_market_data_snapshot(
+                conids,
+                fields=['31', '84', '86', '7283', '7088']
+            )
+        
+        # STEP 3: Parse stock data (remove duplicate batch call)
+        # The next section "STEP 3: Batch get market data" should be deleted
+        # Just continue with parsing the snapshots we already have
         conid_to_symbol = {v: k for k, v in symbol_to_conid.items()}
         stock_data = {}
         
@@ -313,13 +355,26 @@ class PutScanner:
                     stock_conid=data['conid'],
                     stock_price=data['price'],
                     target_strike=target_strike,
-                    expiry_date=expiry_date,
-                    target_delta=target_delta,
+                    expiry_date=max_expiry,
+                    target_delta=max_delta,
                     stock_ivhv=data['ivhv']
                 )
-                
+                logger.debug(f"{symbol}: Option data found: {option_data}")
+
                 if not option_data:
-                    logger.info(f"{symbol:<6} - No suitable option found")
+                    # Log which filters were active
+                    active_filters = []
+                    if max_delta is not None:
+                        active_filters.append(f"max_delta={max_delta:.3f}")
+                    if min_premium is not None:
+                        active_filters.append(f"min_premium=${min_premium:.2f}")
+                    if min_annualized_return is not None:
+                        active_filters.append(f"min_ann_ret={min_annualized_return:.1f}%")
+                    if max_days_to_expiry is not None:
+                        active_filters.append(f"max_DTE={max_days_to_expiry}")
+                    
+                    filter_str = f" (filters: {', '.join(active_filters)})" if active_filters else ""
+                    logger.info(f"{symbol:<6} - No suitable option found{filter_str}")
                     continue
                 
                 # Calculate mid price
@@ -327,32 +382,61 @@ class PutScanner:
                 if option_data['bid'] is not None and option_data['ask'] is not None:
                     mid_price = (option_data['bid'] + option_data['ask']) / 2
                 
-                # Apply premium filter
-                if min_premium is not None and mid_price is not None:
-                    if mid_price < min_premium:
-                        logger.info(f"{symbol:<6} ${option_data['strike']:<6.0f} Δ{abs(option_data.get('delta', 0)):<6.3f} "
-                                  f"Premium ${mid_price:.2f} < min ${min_premium:.2f}")
-                        continue
-                
                 # Calculate annualized return
                 ann_return = None
                 if mid_price is not None and days_to_expiry > 0:
                     pct_return = (mid_price / option_data['strike']) * 100
                     ann_return = (pct_return / days_to_expiry) * 365
                 
+                # LOG THE OPTION DATA BEFORE FILTERING (DEBUG LEVEL)
+                delta_val = abs(option_data['delta']) if option_data.get('delta') is not None else None
+                delta_str = f"{delta_val:.3f}" if delta_val is not None else "N/A"
+                mid_str = f"${mid_price:.2f}" if mid_price is not None else "N/A"
+                ann_str = f"{ann_return:.1f}%" if ann_return is not None else "N/A"
+                
+                logger.debug(f"  ${option_data['strike']:<6.0f}P: "
+                           f"delta={delta_str}, "
+                           f"premium={mid_str}, "
+                           f"ann.ret={ann_str}, "
+                           f"DTE={days_to_expiry}")
+                
+                # Apply filters and collect reasons if they fail
+                filter_reasons = []
+                
+                # Apply premium filter
+                if min_premium is not None and mid_price is not None:
+                    if mid_price < min_premium:
+                        filter_reasons.append(f"premium ${mid_price:.2f} < min ${min_premium:.2f}")
+                
+                # Apply delta filter (from option_data)
+                if max_delta is not None and option_data.get('delta') is not None:
+                    abs_delta = abs(option_data['delta'])
+                    if abs_delta > max_delta:
+                        filter_reasons.append(f"delta {abs_delta:.3f} > max {max_delta:.3f}")
+                
                 # Apply annualized return filter
                 if min_annualized_return is not None and ann_return is not None:
                     if ann_return < min_annualized_return:
-                        logger.info(f"{symbol:<6} ${option_data['strike']:<6.0f} Δ{abs(option_data.get('delta', 0)):<6.3f} "
-                                  f"AnnRet {ann_return:.1f}% < min {min_annualized_return:.1f}%")
-                        continue
+                        filter_reasons.append(f"ann.ret {ann_return:.1f}% < min {min_annualized_return:.1f}%")
+                
+                # Apply max DTE filter
+                if max_days_to_expiry is not None:
+                    if days_to_expiry > max_days_to_expiry:
+                        filter_reasons.append(f"DTE {days_to_expiry} > max {max_days_to_expiry}")
+                
+                # If any filters failed, log why and skip (DEBUG LEVEL)
+                if filter_reasons:
+                    logger.debug(f"    FILTERED: {', '.join(filter_reasons)}")
+                    continue
+                else:
+                    logger.debug(f"    ✓ PASSED all filters")
                 
                 # Create result
                 result = PutScanResult(
                     symbol=symbol,
                     stock_price=data['price'],
                     strike=option_data['strike'],
-                    expiry=expiry_date,
+                    expiry=max_expiry,
                     bid=option_data['bid'],
                     ask=option_data['ask'],
                     mid=mid_price,
@@ -368,13 +452,15 @@ class PutScanner:
                 results.append(result)
                 
                 # Print single-line summary
-                ivr_str = f"{result.ivr:.1f}%" if result.ivr else "N/A"
+                ivr_str = f"{result['ivr']:.1f}%" if result.get('ivr') else "N/A"
                 ann_ret_str = f"{ann_return:.1f}%" if ann_return else "N/A"
-                delta_str = f"{abs(result.delta):.3f}" if result.delta else "N/A"
+                delta_str = f"{abs(result['delta']):.3f}" if result.get('delta') else "N/A"
                 
-                logger.info(f"{symbol:<6} {expiry_date.strftime('%Y-%m-%d'):<10} "
-                          f"${result.strike:<6.0f} {delta_str:<7} {ivr_str:<6} {ann_ret_str:<7} ✓")
-                
+                expiry_str = max_expiry.strftime('%Y-%m-%d')
+                logger.info("Expiry is: " + expiry_str)
+                logger.info(f"{symbol:<6} {expiry_str:<10} "
+                          f"${result['strike']:<6.0f} {delta_str:<7} {ivr_str:<6} {ann_ret_str:<7} ✓")
+                logger.info("ALL DONE")
             except Exception as e:
                 logger.info(f"{symbol:<6} - Error: {str(e)[:40]}")
                 continue
@@ -393,10 +479,10 @@ class PutScanner:
         if output_file and results:
             scan_params = {
                 'Index': index.upper(),
-                'Target Expiry': expiry_date.strftime('%Y-%m-%d'),
+                'Target Expiry': max_expiry.strftime('%Y-%m-%d'),
                 'Days to Expiry': days_to_expiry,
                 'Strike %': f"{strike_pct_below}%",
-                'Target Delta': target_delta if target_delta else 'N/A',
+                'Target Delta': max_delta if max_delta else 'N/A',
                 'Min IVR': f"{min_ivr}%" if min_ivr else 'N/A',
                 'Min Premium': f"${min_premium}" if min_premium else 'N/A',
                 'Min Ann. Return': f"{min_annualized_return}%" if min_annualized_return else 'N/A',
@@ -439,6 +525,8 @@ class PutScanner:
             if hasattr(self.config, 'num_strikes'):
                 num_strikes = self.config.num_strikes
             
+            logger.debug(f"{symbol}: Getting {num_strikes} strikes near ${target_strike:.2f}")
+            
             # Get options near target strike using the option chain
             nearby_strikes = self.client.get_options_near_strike(
                 stock_conid=stock_conid,
@@ -449,7 +537,10 @@ class PutScanner:
             )
             
             if not nearby_strikes:
+                logger.debug(f"{symbol}: No strikes returned from get_options_near_strike")
                 return None
+            
+            logger.debug(f"{symbol}: Found {len(nearby_strikes)} strikes to evaluate")
             
             if target_delta:
                 # Use delta-based selection
@@ -462,6 +553,8 @@ class PutScanner:
                         'expiry_date': expiry_date
                     })
                 
+                logger.debug(f"{symbol}: Batch requesting option data for {len(batch_specs)} strikes...")
+                
                 # Batch request all option data
                 batch_results = self.client.get_options_data_batch(
                     batch_specs, 
@@ -469,11 +562,16 @@ class PutScanner:
                     skip_preflight=True  # Pre-flight already done in get_options_near_strike()
                 )
                 
+                logger.debug(f"{symbol}: Received {len(batch_results)} option data results")
+                
                 # Find best delta match
                 best_option = None
                 best_delta_diff = float('inf')
                 
                 for strike_info, option_result in zip(nearby_strikes, batch_results):
+                    # LOG THE RAW OPTION RESULT
+                    logger.debug(f"{symbol}: ${strike_info['strike']:.0f}P - Raw option_result: {option_result}")
+                    
                     if option_result and option_result.get('delta') is not None:
                         # Add stock-level IV/HV to the result
                         option_result['ivr'] = stock_ivhv
@@ -481,15 +579,26 @@ class PutScanner:
                         abs_delta = abs(option_result['delta'])
                         delta_diff = abs(abs_delta - target_delta)
                         
+                        logger.debug(f"{symbol}: ${strike_info['strike']:.0f}P - delta={abs_delta:.3f}, diff from target={delta_diff:.3f}")
+                        
                         if delta_diff < best_delta_diff:
                             best_delta_diff = delta_diff
                             best_option = option_result
+                    else:
+                        logger.debug(f"{symbol}: ${strike_info['strike']:.0f}P - No option data or delta")
+                
+                if best_option:
+                    logger.debug(f"{symbol}: Best option found: ${best_option['strike']:.0f}P with delta={abs(best_option['delta']):.3f}")
+                else:
+                    logger.debug(f"{symbol}: No options with valid delta data")
                 
                 return best_option
             
             else:
                 # Original behavior: use strike closest to target price
                 closest_strike_info = nearby_strikes[0]  # Already sorted by distance
+                
+                logger.debug(f"{symbol}: Using closest strike ${closest_strike_info['strike']:.0f}")
                 
                 result = self.client.get_option_data(
                     stock_conid=stock_conid,
@@ -501,12 +610,14 @@ class PutScanner:
                 if result:
                     # Add stock-level IV/HV to the result
                     result['ivr'] = stock_ivhv
+                    logger.debug(f"{symbol}: Got option data for ${closest_strike_info['strike']:.0f}P")
                     return result
                 else:
+                    logger.debug(f"{symbol}: No option data returned for ${closest_strike_info['strike']:.0f}P")
                     return None
                     
         except Exception as e:
-            logger.debug(f"Error finding option for {symbol}: {e}")
+            logger.debug(f"{symbol}: Exception in _find_put_option_with_conid: {e}")
             return None
 
     def _get_stock_price(self, symbol: str) -> Optional[float]:
@@ -621,7 +732,7 @@ class PutScanner:
                         option_result['ivr'] = stock_ivhv
                         
                         abs_delta = abs(option_result['delta'])
-                        delta_diff = abs(abs_delta - target_delta)
+                        delta_diff = abs_delta - target_delta
                         tested_count += 1
                         
                         logger.info(f"    ${strike_info['strike']:.0f}: Δ={abs_delta:.3f} (diff: {delta_diff:.3f})")
@@ -634,7 +745,7 @@ class PutScanner:
                     logger.info(f"  Best match: ${best_option['strike']:.0f} with Δ={abs(best_option['delta']):.3f}")
                     return best_option
                 else:
-                    logger.debug(f"  Reason: Could not find option with valid delta data")
+                    logger.debug(f"  Reason: could not find option with valid delta data")
                     return None
             
             else:
@@ -653,7 +764,7 @@ class PutScanner:
                     result['ivr'] = stock_ivhv
                     return result
                 else:
-                    logger.debug(f"  Reason: Could not get option data for strike ${closest_strike_info['strike']:.0f}")
+                    logger.debug(f"  Reason: could not get option data for strike ${closest_strike_info['strike']:.0f}")
                     return None
                     
         except Exception as e:

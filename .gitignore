@@ -158,3 +158,6 @@ ibkr.conf
 *.tmp
 *.bak
 *.backup
+
+# Data cache
+data_cache/

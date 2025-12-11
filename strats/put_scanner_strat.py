@@ -30,109 +30,14 @@ sys.path.insert(0, vol_dir)
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 from ibkr.ibkr import IBWebAPIClient
 from utils.put_scanner import PutScanner, PutScanResult
-
-
-@dataclass
-class ScannerConfig:
-    """Configuration for put scanner strategy."""
-    indices: List[str]
-    min_ivr: float
-    strike_pct_below: float
-    target_delta: float
-    check_200d_mavg: bool
-    max_symbols: int = 0  # 0 = no limit
-    days_to_expiry: Optional[int] = None
-    min_premium: Optional[float] = None
-    min_volume: Optional[int] = None
-    min_annualized_return: Optional[float] = None
-    top_n: int = 20
-    num_strikes: int = 10  # Number of strikes to evaluate
-    output_file: str = 'results/put_scan_results.csv'
-    
-    @classmethod
-    def from_file(cls, config_file: str) -> 'ScannerConfig':
-        """
-        Load configuration from file.
-        
-        Args:
-            config_file: Path to configuration file
-            
-        Returns:
-            ScannerConfig object
-        """
-        config = configparser.ConfigParser()
-        config.read(config_file)
-        
-        scan_section = config['SCANNER']
-        
-        # Parse indices (comma-separated)
-        indices_str = scan_section.get('indices', 'XLE')
-        indices = [idx.strip().upper() for idx in indices_str.split(',')]
-        
-        # Required parameters
-        min_ivr = scan_section.getfloat('min_ivr', 50.0)
-        strike_pct_below = scan_section.getfloat('strike_pct_below', 5.0)
-        target_delta = scan_section.getfloat('target_delta', 0.20)
-        check_200d_mavg = scan_section.getboolean('check_200d_mavg', False)
-        max_symbols = scan_section.getint('max_symbols', 0)
-        
-        # Optional parameters
-        days_to_expiry = scan_section.getint('days_to_expiry', fallback=None)
-        min_premium = scan_section.getfloat('min_premium', fallback=None)
-        min_volume = scan_section.getint('min_volume', fallback=None)
-        min_annualized_return = scan_section.getfloat('min_annualized_return', fallback=None)
-        top_n = scan_section.getint('top_n', 20)
-        num_strikes = scan_section.getint('num_strikes', 10)
-        output_file = scan_section.get('output_file', 'results/put_scan_results.csv')
-        
-        return cls(
-            indices=indices,
-            min_ivr=min_ivr,
-            strike_pct_below=strike_pct_below,
-            target_delta=target_delta,
-            check_200d_mavg=check_200d_mavg,
-            max_symbols=max_symbols,
-            days_to_expiry=days_to_expiry,
-            min_premium=min_premium,
-            min_volume=min_volume,
-            min_annualized_return=min_annualized_return,
-            top_n=top_n,
-            num_strikes=num_strikes,
-            output_file=output_file
-        )
-    
-    def __str__(self) -> str:
-        """String representation of config."""
-        max_sym_str = f"{self.max_symbols}" if self.max_symbols > 0 else "unlimited"
-        lines = [
-            "Scanner Config:",
-            f"  Indices: {', '.join(self.indices)}",
-            f"  Max Symbols: {max_sym_str}",
-            f"  Min IVR: {self.min_ivr:.1f}%",
-            f"  Strike: {self.strike_pct_below:.1f}% below current price",
-            f"  Target Delta: {self.target_delta:.2f}",
-            f"  Check 200D MA: {self.check_200d_mavg}",
-            f"  Days to Expiry: {self.days_to_expiry if self.days_to_expiry else 'Next Friday'}",
-        ]
-        
-        if self.min_premium:
-            lines.append(f"  Min Premium: ${self.min_premium:.2f}")
-        if self.min_volume:
-            lines.append(f"  Min Volume: {self.min_volume}")
-        if self.min_annualized_return:
-            lines.append(f"  Min Annualized Return: {self.min_annualized_return:.1f}%")
-        
-        lines.append(f"  Top N: {self.top_n}")
-        
-        return "\n".join(lines)
-
+from utils.scanner_config import ScannerConfig  # ADD this line
 
 class PutScannerStrategy:
     """
@@ -246,51 +151,40 @@ class PutScannerStrategy:
             index: Index to scan
             
         Returns:
-            List of PutScanResult objects ranked by IVR
+            List of PutScanResult objects ranked by annualized return
         """
         if not self.scanner or not self.scan_config:
             logger.error("Scanner not initialized. Call connect() and load_config() first.")
             return []
         
         logger.info("=" * 100)
-        logger.info(f"SCANNING {index.upper()} FOR HIGH IVR PUT OPPORTUNITIES")
+        # NEW: Show test mode in header
+        if self.scan_config.test_symbol:
+            logger.info(f"TEST MODE: SCANNING {self.scan_config.test_symbol}")
+        else:
+            logger.info(f"SCANNING {index.upper()} FOR HIGH IVR PUT OPPORTUNITIES")
         logger.info("=" * 100)
         
         # Calculate expiry date
         expiry_date = None
-        if self.scan_config.days_to_expiry is not None:
-            expiry_date = date.today() + timedelta(days=self.scan_config.days_to_expiry)
+        if self.scan_config.max_days_to_expiry is not None:
+            expiry_date = date.today() + timedelta(days=self.scan_config.max_days_to_expiry)
         
         # Scan the index using the scanner's scan method
         results = self.scanner.scan(
             index=index,
             strike_pct_below=self.scan_config.strike_pct_below,
             min_ivr=self.scan_config.min_ivr,
-            target_delta=self.scan_config.target_delta,  # Pass target_delta
+            max_delta=self.scan_config.max_delta,
             expiry_date=expiry_date,
             max_symbols=self.scan_config.max_symbols,
             min_premium=self.scan_config.min_premium,
             min_annualized_return=self.scan_config.min_annualized_return,
-            output_file=self.scan_config.output_file
+            output_file=self.scan_config.output_file,
+            test_symbol=self.scan_config.test_symbol  # NEW: pass test_symbol
         )
         
-        # Apply additional filters
-        filtered_results = [r for r in results if self._apply_filters(r)]
-        
-        if len(filtered_results) < len(results):
-            logger.info(f"Applied additional filters: {len(results)} -> {len(filtered_results)} results")
-        
-        # Print results
-        if filtered_results:
-            logger.info(f"\n✓ Found {len(filtered_results)} opportunities")
-            self.scanner.print_results(filtered_results, top_n=self.scan_config.top_n)
-            
-            # Print summary statistics
-            self._print_summary(filtered_results)
-        else:
-            logger.warning("No opportunities found matching criteria")
-        
-        return filtered_results
+        return results
     
     def scan_all_indices(self) -> Dict[str, List[PutScanResult]]:
         """
@@ -463,8 +357,8 @@ def main():
     
     # Determine expiry date
     expiry_date = None
-    if config.days_to_expiry:
-        expiry_date = date.today() + timedelta(days=config.days_to_expiry)
+    if config.max_days_to_expiry:  # Changed from config.days_to_expiry
+        expiry_date = date.today() + timedelta(days=config.max_days_to_expiry)
     
     # Scan each index
     all_results = []
@@ -477,12 +371,14 @@ def main():
             index=index,
             strike_pct_below=config.strike_pct_below,
             min_ivr=config.min_ivr,
-            target_delta=config.target_delta,
+            max_delta=config.max_delta,
             expiry_date=expiry_date,
             max_symbols=config.max_symbols,
             min_premium=config.min_premium,
             min_annualized_return=config.min_annualized_return,
-            output_file=config.output_file
+            max_days_to_expiry=config.max_days_to_expiry,
+            output_file=config.output_file,
+            test_symbols=config.test_symbols  # CHANGED from test_symbol
         )
         
         all_results.extend(results)
