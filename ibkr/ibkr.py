@@ -145,6 +145,7 @@ class IBWebAPIClient:
                 elif account_ids:
                     self.account_id = account_ids[0]
             
+            '''
             # Step 2: Make a test market data subscription (helps initialize data streams)
             logger.debug("Initializing market data streams...")
             test_contracts = self.search_contracts('SPY')
@@ -155,6 +156,7 @@ class IBWebAPIClient:
                     self.get_market_data_snapshot(spy_conid, fields=['31'])
             
             # Step 3: Wait for API to stabilize
+            '''
             logger.debug("Waiting for API to stabilize...")
             time.sleep(5)
             
@@ -1250,7 +1252,7 @@ class IBWebAPIClient:
         if not skip_preflight:
             # Group by stock_conid and expiry for efficient querying
             specs_by_underlying = {}
-            for i, spec in enumerate(options_specs):
+            for i, spec in enumerate(options_specs):  
                 key = (spec['stock_conid'], spec['expiry_date'].strftime('%Y%m'))
                 if key not in specs_by_underlying:
                     specs_by_underlying[key] = []
@@ -1353,6 +1355,12 @@ class IBWebAPIClient:
         # Step 3: Get market data for ALL options in ONE batch call
         logger.debug(f"Step 3: Requesting market data for ALL {len(valid_conids)} options in ONE batch call...")
         
+        # Create conid to strike mapping for later reference
+        conid_to_strike = {}
+        for i, spec in enumerate(options_specs):
+            if valid_conids[i]:  # CHANGED from valid_conids_list
+                conid_to_strike[valid_conids[i]] = spec['strike']
+        
         # Small delay to allow data to populate
         time.sleep(0.5)
         
@@ -1361,10 +1369,6 @@ class IBWebAPIClient:
             fields=['31', '84', '86', '87', '7308', '7309', '7310', '7311', '7633'],
             ensure_preflight=False
         )
-        
-        if not snapshots:
-            logger.warning("No market data returned from batch request")
-            return [None] * len(options_specs)
         
         # Check if we got preflight response (only metadata, no actual data)
         metadata_keys = {'conid', 'conidEx', '_updated', 'server_id', '6119', '6509'}
@@ -1415,6 +1419,7 @@ class IBWebAPIClient:
             
             results[original_idx] = {
                 'strike': spec['strike'],
+                'conid': conid,  # ADD THIS LINE - include conid in result
                 'bid': to_float(snapshot.get('84')),
                 'ask': to_float(snapshot.get('86')),
                 'last': to_float(snapshot.get('31')),
@@ -1586,3 +1591,129 @@ class IBWebAPIClient:
         logger.info(f"Successfully got prices for {success_count}/{len(symbols)} symbols")
         
         return results
+
+    def get_options_by_expiry_and_strike(
+        self,
+        stock_conid: int,
+        max_expiry_date: date,
+        max_strike: float,
+        right: str = 'P',
+        exchange: str = 'SMART',
+        num_strikes: int = 10
+    ) -> List[Dict]:
+        """
+        Get all option contracts with expiry <= max_expiry_date and strike <= max_strike.
+        
+        Args:
+            stock_conid: Stock contract ID
+            max_expiry_date: Maximum expiry date (inclusive)
+            max_strike: Maximum strike price
+            right: 'P' for put, 'C' for call
+            exchange: Exchange (default: 'SMART')
+            num_strikes: Maximum number of strikes to return (closest to max_strike)
+        
+        Returns:
+            List of dicts with keys: strike, expiry, conid, days_to_expiry
+        """
+        try:
+            logger.debug(f"Getting {right} options: strike <= ${max_strike:.2f}, expiry <= {max_expiry_date}, max {num_strikes} strikes")
+            
+            # Get available strikes for the month
+            strikes_data = self.get_option_strikes(stock_conid, max_expiry_date)
+            
+            if not strikes_data:
+                logger.warning("No strikes data returned")
+                return []
+            
+            # Get strikes for the requested right
+            right_key = 'put' if right == 'P' else 'call'
+            available_strikes = strikes_data.get(right_key, [])
+            
+            if not available_strikes:
+                logger.debug(f"No {right_key} strikes available")
+                return []
+            
+            # Filter strikes below max_strike and sort in descending order
+            filtered_strikes = sorted(
+                [s for s in available_strikes if float(s) <= max_strike],
+                reverse=True
+            )
+            
+            # Take only the top num_strikes (closest to max_strike)
+            selected_strikes = filtered_strikes[:num_strikes]
+            
+            logger.debug(f"Selected top {len(selected_strikes)}/{len(filtered_strikes)} strikes (descending from ${max_strike:.2f})")
+            
+            # For each strike, get all option contracts (different expiries)
+            all_options = []
+            today = date.today()
+            month_str = max_expiry_date.strftime('%Y%m')
+            
+            for strike in selected_strikes:
+                strike_val = float(strike)
+                
+                # Get option contract info for this strike
+                secdef_url = f"{self.base_url}/iserver/secdef/info"
+                params = {
+                    'conid': stock_conid,
+                    'sectype': 'OPT',
+                    'month': month_str,
+                    'exchange': exchange,
+                    'strike': strike_val,
+                    'right': right
+                }
+                
+                time.sleep(0.2)  # Rate limiting
+                
+                response = self._make_request('GET', secdef_url, params=params)
+                
+                if response.status_code != 200:
+                    continue
+                
+                contracts = response.json()
+                
+                if not isinstance(contracts, list):
+                    contracts = [contracts]
+                
+                # Filter by expiry date
+                for contract in contracts:
+                    expiry_str = contract.get('maturityDate')
+                    conid = contract.get('conid')
+                    
+                    if not expiry_str or not conid:
+                        continue
+                    
+                    try:
+                        expiry_date = datetime.strptime(expiry_str, '%Y%m%d').date()
+                    except:
+                        continue
+                    
+                    # Only include if within our window
+                    if today <= expiry_date <= max_expiry_date:
+                        days_to_expiry = (expiry_date - today).days
+                        
+                        all_options.append({
+                            'strike': strike_val,
+                            'expiry': expiry_str,
+                            'conid': conid,
+                            'days_to_expiry': days_to_expiry
+                        })
+        
+            # Sort by expiry, then by strike (descending)
+            all_options.sort(key=lambda x: (x['expiry'], -x['strike']))
+            
+            logger.debug(f"Found {len(all_options)} total options meeting criteria")
+            
+            # Log each option contract we're returning
+            if all_options:
+                logger.debug("Returning option contracts:")
+                for opt in all_options:
+                    logger.debug(f"  Strike ${opt['strike']:.2f}, Expiry {opt['expiry']}, ConID {opt['conid']}, DTE {opt['days_to_expiry']}d")
+            else:
+                logger.debug("No options found meeting criteria")
+            
+            return all_options
+            
+        except Exception as e:
+            logger.error(f"Error getting options: {e}", exc_info=True)
+            return []
